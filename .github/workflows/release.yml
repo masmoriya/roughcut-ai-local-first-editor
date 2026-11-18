@@ -25,18 +25,18 @@ jobs:
     env:
       HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
       # MACOSX_DEPLOYMENT_TARGET=11.0 makes ggml-metal emit @available runtime
       # checks (___isPlatformVersionAtLeast); rustc links -nodefaultlibs, so
       # pull in clang's runtime explicitly.
       - name: Link clang runtime for availability checks
         run: echo "RUSTFLAGS=-Clink-arg=$(clang --print-resource-dir)/lib/darwin/libclang_rt.osx.a" >> "$GITHUB_ENV"
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           prefix-key: v2-metal  # cache from pre-metal builds left stale ggml objects
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
@@ -67,7 +67,7 @@ jobs:
       - name: Build MCP shim (release)
         run: cargo build --release -p roughcut-mcp-shim
       - name: Attach artifacts to the release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             target/release/bundle/dmg/*.dmg
