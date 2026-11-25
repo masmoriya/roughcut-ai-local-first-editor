@@ -96,7 +96,8 @@ impl Caller {
                 "detect_silences" | "get_suggestions" | "get_cut_proposal"
                 | "find_segments" | "read_transcript" | "get_timeline" => true,
                 "remove_silences" | "generate_rough_cut" | "cut_range" | "cut_passage"
-                | "cut_by_transcript" | "story_edit" | "plan_duration_cut" => {
+                | "cut_by_transcript" | "restore_range" | "restore_by_transcript"
+                | "story_edit" | "plan_duration_cut" => {
                     attribute_to == ActionSource::LocalAi
                 }
                 _ => false,

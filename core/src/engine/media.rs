@@ -689,7 +689,9 @@ impl super::Editor {
         let mut transcript = self
             .get_transcript(project_id)?
             .ok_or_else(|| CoreError::InvalidArg("project has no transcript; transcribe first".into()))?;
-        let source_before = source_identity(&media.file_path)?;
+        let source_before = source_identity(&media.file_path).map_err(|error| {
+            CoreError::Unavailable(format!("Source media is unavailable for word timing: {error}"))
+        })?;
         if media.source_audio_tracks.is_some_and(|tracks| tracks > 1) && transcript.source_audio_stream_index.is_none() {
             return Err(CoreError::InvalidArg("This transcript has no selected dialogue track".into()));
         }

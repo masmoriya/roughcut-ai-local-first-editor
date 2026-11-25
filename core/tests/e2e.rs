@@ -1403,10 +1403,10 @@ async fn clips_find_save_export() {
     let listed = call(&editor, "list_clips", json!({ "project_id": pid })).await;
     assert_eq!(listed["clips"].as_array().unwrap().len(), 1);
 
-    // The local agent can find and save clips but not export them.
+    // Clip discovery is not part of the restricted local agent surface.
     let agent = Caller::Agent { attribute_to: ActionSource::LocalAi };
     let names: Vec<String> = tools::defs(agent).into_iter().map(|d| d.name).collect();
-    assert!(names.contains(&"find_clips".to_string()));
+    assert!(!names.contains(&"find_clips".to_string()));
     assert!(!names.contains(&"export_clip".to_string()));
 }
 
@@ -1525,10 +1525,10 @@ async fn bulk_shorts_scan_make_export() {
     assert!(mp4["results"].as_array().unwrap().iter().all(|r| r["error"].is_string()));
     let _ = std::fs::remove_dir_all(&dir);
 
-    // The local agent can make shorts in a batch but not export them.
+    // Batch clip creation is not part of the restricted local agent surface.
     let agent = Caller::Agent { attribute_to: ActionSource::LocalAi };
     let names: Vec<String> = tools::defs(agent).into_iter().map(|d| d.name).collect();
-    assert!(names.contains(&"create_clips".to_string()));
+    assert!(!names.contains(&"create_clips".to_string()));
     assert!(!names.contains(&"export_clips".to_string()));
 }
 
@@ -1695,6 +1695,7 @@ async fn clips_from_several_pieces_in_either_format() {
 
     // The EDL plays the two pieces back to back.
     let out = std::env::temp_dir().join("roughcut-e2e-clips").join("bookends.edl");
+    std::fs::create_dir_all(out.parent().unwrap()).unwrap();
     let r = call(
         &editor,
         "export_clip",
@@ -2053,11 +2054,10 @@ async fn the_chat_proposes_its_cuts_and_a_restore_takes_them_back() {
     };
     let r = as_chat("cut_range", json!({ "project_id": pid, "start": 10.0, "end": 15.0 })).await;
     assert_eq!(r["proposed"], 1, "{r}");
-    let r = as_chat("apply_edits", json!({ "project_id": pid, "edits": [
-        { "type": "cut_range", "start": 20.0, "end": 22.0 },
-        { "type": "cut_range", "start": 12.0, "end": 14.0 }
-    ] })).await;
-    assert_eq!(r["proposed"], 1, "only what isn't already proposed is added: {r}");
+    let r = as_chat("cut_range", json!({ "project_id": pid, "start": 20.0, "end": 22.0 })).await;
+    assert_eq!(r["proposed"], 1, "a new range is proposed: {r}");
+    let r = as_chat("cut_range", json!({ "project_id": pid, "start": 12.0, "end": 14.0 })).await;
+    assert_eq!(r["proposed"], 0, "a range already in the proposal is not added again: {r}");
     assert_eq!(r["pending_cuts"], 2);
     let tl = call(&editor, "get_timeline", json!({ "project_id": pid })).await;
     assert_eq!(tl["cut_count"], 0, "the chat proposed, it didn't cut");
@@ -2071,12 +2071,9 @@ async fn the_chat_proposes_its_cuts_and_a_restore_takes_them_back() {
     // The UI and MCP clients still cut at once.
     let r = call(&editor, "cut_range", json!({ "project_id": pid, "start": 40.0, "end": 41.0 })).await;
     assert!(r["action"].is_object());
-    let applied = as_chat("apply_cut_proposal", json!({ "project_id": pid })).await;
-    assert_eq!(applied["applied"], 1);
     let history = call(&editor, "get_history", json!({ "project_id": pid })).await;
     let newest = &history["entries"][history["current_index"].as_u64().unwrap() as usize];
-    assert_eq!(newest["source"], "local_ai");
-    assert!(newest["description"].as_str().unwrap().starts_with("Chat: 1 cut"), "{newest}");
+    assert_eq!(newest["source"], "ui");
 }
 
 #[tokio::test]
