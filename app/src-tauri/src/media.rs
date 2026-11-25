@@ -11,13 +11,11 @@
 //!
 //! Here a range with an end is answered in full (up to `MAX_BOUNDED`), an
 //! open-ended one in `OPEN_CHUNK` pieces (the player asks again for the
-//! rest), on the blocking thread pool. Which paths may be read is the asset
-//! protocol's scope (`tauri.conf.json`), so the two can't drift apart.
-//! Thumbnails and waveform peaks still use the asset protocol: they're small
-//! and read whole.
+//! rest), on the blocking thread pool. Only paths recorded from successful
+//! media operations may be served, including thumbnails and waveform peaks.
 
 use std::fs::File;
-use std::io::{ErrorKind, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use tauri::http::{header, Method, Request, Response, StatusCode};
 
@@ -37,25 +35,30 @@ pub fn handle<R: tauri::Runtime>(
     responder: tauri::UriSchemeResponder,
 ) {
     use tauri::Manager;
-    let scope = ctx.app_handle().asset_protocol_scope();
+    let access = ctx.app_handle().state::<crate::AppState>().media_access.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        responder.respond(respond(&request, |p| scope.is_allowed(p)));
+        responder.respond(respond(&request, |p| access.open(p).ok_or(StatusCode::FORBIDDEN)));
     });
 }
 
-/// The response to one request. `allowed` decides which files may be read.
-pub fn respond(request: &Request<Vec<u8>>, allowed: impl Fn(&Path) -> bool) -> Response<Vec<u8>> {
+/// The response to one request. The caller opens and authorizes the file.
+pub fn respond(
+    request: &Request<Vec<u8>>,
+    open: impl Fn(&Path) -> Result<(PathBuf, File), StatusCode>,
+) -> Response<Vec<u8>> {
+    let origin = request.headers().get(header::ORIGIN);
+    if origin.is_some_and(|origin| !origin.to_str().is_ok_and(allowed_origin)) {
+        return status(StatusCode::FORBIDDEN);
+    }
+    if !matches!(*request.method(), Method::GET | Method::HEAD) {
+        return status(StatusCode::METHOD_NOT_ALLOWED);
+    }
     let Some(path) = file_path(request.uri().path()) else {
         return status(StatusCode::FORBIDDEN);
     };
-    if !allowed(&path) {
-        return status(StatusCode::FORBIDDEN);
-    }
-    let mut file = match File::open(&path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == ErrorKind::NotFound => return status(StatusCode::NOT_FOUND),
-        Err(e) if e.kind() == ErrorKind::PermissionDenied => return status(StatusCode::FORBIDDEN),
-        Err(_) => return status(StatusCode::INTERNAL_SERVER_ERROR),
+    let (path, mut file) = match open(&path) {
+        Ok(file) => file,
+        Err(error) => return status(error),
     };
     let len = match file.metadata() {
         Ok(m) if m.is_file() => m.len(),
@@ -81,8 +84,14 @@ pub fn respond(request: &Request<Vec<u8>>, allowed: impl Fn(&Path) -> bool) -> R
     let n = if len == 0 { 0 } else { end - start + 1 };
     let mut builder = Response::builder()
         .header(header::CONTENT_TYPE, mime_type(&path))
+        .header(header::CACHE_CONTROL, "no-store")
+        .header("X-Content-Type-Options", "nosniff")
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CONTENT_LENGTH, n);
+    if let Some(origin) = origin {
+        builder = builder.header(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone())
+            .header(header::VARY, "Origin");
+    }
     builder = if partial {
         builder
             .status(StatusCode::PARTIAL_CONTENT)
@@ -105,12 +114,27 @@ pub fn respond(request: &Request<Vec<u8>>, allowed: impl Fn(&Path) -> bool) -> R
     }
 }
 
+fn allowed_origin(origin: &str) -> bool {
+    matches!(origin, "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost")
+        || (cfg!(debug_assertions) && origin == "http://127.0.0.1:1420")
+}
+
 /// The file path in a request: the URL path minus its leading `/`,
 /// percent-decoded (`convertFileSrc` encodes the whole path). None when it
 /// isn't an absolute path or climbs with `..`.
 fn file_path(url_path: &str) -> Option<PathBuf> {
     let encoded = url_path.strip_prefix('/').unwrap_or(url_path);
+    let bytes = encoded.as_bytes();
+    if bytes.iter().enumerate().any(|(index, byte)| {
+        *byte == b'%' && !bytes.get(index + 1..index + 3)
+            .is_some_and(|pair| pair.iter().all(u8::is_ascii_hexdigit))
+    }) {
+        return None;
+    }
     let decoded = percent_encoding::percent_decode_str(encoded).decode_utf8().ok()?;
+    if decoded.contains('\0') {
+        return None;
+    }
     let path = PathBuf::from(decoded.as_ref());
     let climbs = path.components().any(|c| c == Component::ParentDir);
     (path.is_absolute() && !climbs).then_some(path)
@@ -133,23 +157,32 @@ fn parse_range(header: &str, len: u64) -> Option<(u64, u64)> {
         if n == 0 {
             return None;
         }
-        (len.saturating_sub(n), len - 1)
+        (len.saturating_sub(n.min(MAX_BOUNDED)), len - 1)
     } else {
         let start: u64 = a.parse().ok()?;
         if start >= len {
             return None;
         }
         if b.is_empty() {
-            (start, (start + OPEN_CHUNK - 1).min(len - 1))
+            (start, start.saturating_add(OPEN_CHUNK - 1).min(len - 1))
         } else {
             let end: u64 = b.parse().ok()?;
             if end < start {
                 return None;
             }
-            (start, end.min(len - 1).min(start + MAX_BOUNDED - 1))
+            (start, end.min(len - 1).min(start.saturating_add(MAX_BOUNDED - 1)))
         }
     };
     Some((start, end))
+}
+
+#[cfg(test)]
+#[test]
+fn parse_range_bounds_large_suffixes_and_offsets() {
+    assert_eq!(parse_range("bytes=-18446744073709551615", u64::MAX),
+        Some((u64::MAX - MAX_BOUNDED, u64::MAX - 1)));
+    assert_eq!(parse_range("bytes=18446744073709551613-", u64::MAX),
+        Some((u64::MAX - 2, u64::MAX - 1)));
 }
 
 fn mime_type(path: &Path) -> &'static str {
@@ -159,12 +192,14 @@ fn mime_type(path: &Path) -> &'static str {
         "mov" => "video/quicktime",
         "webm" => "video/webm",
         "mkv" => "video/x-matroska",
+        "avi" => "video/x-msvideo",
         "m4a" => "audio/mp4",
         "mp3" => "audio/mpeg",
         "wav" => "audio/wav",
         "aac" => "audio/aac",
         "flac" => "audio/flac",
         "ogg" | "opus" => "audio/ogg",
+        "jpg" | "jpeg" => "image/jpeg",
         _ => "application/octet-stream",
     }
 }
@@ -189,7 +224,11 @@ mod tests {
         if let Some(r) = range {
             req = req.header(header::RANGE, r);
         }
-        respond(&req.body(vec![]).unwrap(), |_| true)
+        respond(&req.body(vec![]).unwrap(), open_test_file)
+    }
+
+    fn open_test_file(path: &Path) -> Result<(PathBuf, File), StatusCode> {
+        File::open(path).map(|file| (path.to_owned(), file)).map_err(|_| StatusCode::NOT_FOUND)
     }
 
     /// A temp file of `n` bytes where byte i is `i % 251`.
@@ -257,7 +296,7 @@ mod tests {
     fn head_has_headers_and_no_body() {
         let (_d, path) = file(4096);
         let req = Request::builder().method(Method::HEAD).uri(url(&path));
-        let r = respond(&req.body(vec![]).unwrap(), |_| true);
+        let r = respond(&req.body(vec![]).unwrap(), open_test_file);
         assert_eq!(r.status(), StatusCode::OK);
         assert_eq!(r.headers()[header::CONTENT_LENGTH], "4096");
         assert!(r.body().is_empty());
@@ -267,13 +306,26 @@ mod tests {
     fn scope_missing_files_and_bad_paths() {
         let (_d, path) = file(10);
         let req = || Request::builder().uri(url(&path)).body(vec![]).unwrap();
-        assert_eq!(respond(&req(), |_| false).status(), StatusCode::FORBIDDEN);
+        assert_eq!(respond(&req(), |_| Err(StatusCode::FORBIDDEN)).status(), StatusCode::FORBIDDEN);
         assert_eq!(get(&path.with_file_name("gone.mp4"), None).status(), StatusCode::NOT_FOUND);
         assert_eq!(get(path.parent().unwrap(), None).status(), StatusCode::FORBIDDEN, "a directory");
         assert_eq!(file_path("/%2Ftmp%2F..%2Fetc%2Fpasswd"), None, "climbs with ..");
         assert_eq!(file_path("/relative.mp4"), None);
+        assert_eq!(file_path("/%2Ftmp%2Fclip%00.mov"), None);
+        assert_eq!(file_path("/%2Ftmp%2Fclip%ZZ.mov"), None);
+        assert_eq!(file_path("/%2Ftmp%2F100%25%2B.mov"), Some(PathBuf::from("/tmp/100%+.mov")));
         #[cfg(unix)]
         assert_eq!(file_path("/%2FUsers%2Fme%2Fa%20b.mp4"), Some(PathBuf::from("/Users/me/a b.mp4")));
+    }
+
+    #[test]
+    fn foreign_origin_is_denied_before_path_resolution() {
+        let (_dir, path) = file(10);
+        let request = Request::builder().uri(url(&path))
+            .header(header::ORIGIN, "https://outside.example")
+            .body(vec![]).unwrap();
+        let response = respond(&request, |_| panic!("foreign origin reached path resolution"));
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]

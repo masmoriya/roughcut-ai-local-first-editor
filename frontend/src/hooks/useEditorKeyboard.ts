@@ -6,6 +6,18 @@ import { useEffect, useRef } from "react";
 import type { Project, Transcript } from "../ipc/types";
 import { scrubBy, scrubTo, togglePlaying, viewStore } from "../state/viewStore";
 
+function wordAfter(words: readonly { start: number }[], time: number, inclusive: boolean): number {
+  let low = 0;
+  let high = words.length;
+  while (low < high) {
+    const middle = low + Math.floor((high - low) / 2);
+    const start = words[middle]!.start;
+    if (start < time || (!inclusive && start === time)) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
 export function useEditorKeyboard(project: Project | undefined, transcript: Transcript | null | undefined): void {
   // Flat, time-ordered word list for ←/→ word navigation.
   const wordsRef = useRef<{ start: number; end: number }[]>([]);
@@ -18,8 +30,12 @@ export function useEditorKeyboard(project: Project | undefined, transcript: Tran
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const target = e.target as HTMLElement;
-      if (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT" || target.isContentEditable) return;
+      if (e.defaultPrevented || e.isComposing || e.metaKey || e.ctrlKey) return;
+      const target = e.target;
+      if (target instanceof HTMLElement && (
+        target.isContentEditable ||
+        target.closest("input, textarea, select, button, a[href], [role='button']")
+      )) return;
       if (e.code === "Space") {
         e.preventDefault();
         togglePlaying();
@@ -36,9 +52,10 @@ export function useEditorKeyboard(project: Project | undefined, transcript: Tran
         } else {
           // Default: walk the transcript word by word, auditioning the word.
           const t = viewStore.state.playhead;
-          const target = back
-            ? [...words].reverse().find((w) => w.start < t - 0.02)
-            : words.find((w) => w.start > t + 0.02);
+          const index = back
+            ? wordAfter(words, t - 0.02, true) - 1
+            : wordAfter(words, t + 0.02, false);
+          const target = words[index];
           if (target) {
             const ms = Math.min(700, Math.max(160, (target.end - target.start) * 1000));
             scrubTo(target.start, max, ms);

@@ -9,6 +9,7 @@ use crate::error::{CoreError, Result};
 use crate::model::{Media, PlaySpan};
 use async_trait::async_trait;
 use chrono::Utc;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
@@ -47,6 +48,7 @@ pub const PEAKS_PER_SECOND: u32 = 50;
 /// Everything one MP4 render needs. Grew from positional params — layout
 /// compositing (screen + camera bubble) made a struct overdue.
 pub struct RenderJob<'a> {
+    pub audio_stream_index: Option<usize>,
     pub media: &'a Media,
     /// What plays, grouped by piece, in output order. Each piece is read from
     /// its own input seeked to just before it, so a render decodes about what
@@ -71,13 +73,13 @@ pub trait VideoEngine: Send + Sync {
     async fn render_mp4(&self, job: &RenderJob<'_>, sink: &crate::events::SharedSink)
         -> Result<()>;
     /// Extract mono 16 kHz WAV (whisper input) to `out_path`.
-    async fn extract_audio_wav(&self, media: &Media, out_path: &str) -> Result<()>;
+    async fn extract_audio_wav(&self, media: &Media, out_path: &str, stream: Option<usize>) -> Result<()>;
     /// One still frame at `at` seconds, `width` px wide (height keeps the
     /// aspect), written as PNG to `out_path`. Face finding samples these.
     async fn extract_frame(&self, media: &Media, at: f64, width: u32, out_path: &str) -> Result<()>;
     /// Waveform peaks + thumbnail filmstrip, generated once and cached in
     /// `<data dir>/cache/<media id>/`.
-    async fn media_assets(&self, media: &Media) -> Result<MediaAssets>;
+    async fn media_assets(&self, media: &Media, stream: Option<usize>) -> Result<MediaAssets>;
 }
 
 pub fn ffmpeg_available() -> bool {
@@ -96,29 +98,45 @@ pub fn ffprobe_path() -> Option<PathBuf> {
     resolve_binary("ffprobe", "FFPROBE_PATH")
 }
 
+fn executable_file(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else { return false; };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.is_file()
+    }
+}
+
 fn resolve_binary(name: &str, env_var: &str) -> Option<PathBuf> {
     if let Ok(p) = std::env::var(env_var) {
         let p = PathBuf::from(p);
-        if p.is_file() {
+        if p.is_absolute() && executable_file(&p) {
             return Some(p);
         }
     }
     let exe = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
     let bundled = crate::store::data_dir().join("bin").join(&exe);
-    if bundled.is_file() {
+    if bundled.is_absolute() && executable_file(&bundled) {
         return Some(bundled);
     }
     if let Some(paths) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&paths) {
+            if !dir.is_absolute() {
+                continue;
+            }
             let candidate = dir.join(&exe);
-            if candidate.is_file() {
+            if executable_file(&candidate) {
                 return Some(candidate);
             }
         }
     }
     for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"] {
         let candidate = Path::new(dir).join(&exe);
-        if candidate.is_file() {
+        if executable_file(&candidate) {
             return Some(candidate);
         }
     }
@@ -128,35 +146,37 @@ fn resolve_binary(name: &str, env_var: &str) -> Option<PathBuf> {
 fn ffmpeg_cmd() -> Result<Command> {
     let path = ffmpeg_path()
         .ok_or_else(|| CoreError::Unavailable("ffmpeg not found (PATH, Homebrew, or FFMPEG_PATH)".into()))?;
-    Ok(Command::new(path))
+    let mut command = Command::new(path);
+    command.arg("-nostdin");
+    Ok(command)
 }
+
+pub(super) const LOCAL_MEDIA_INPUT: [&str; 4] = [
+    "-protocol_whitelist", "file",
+    "-format_whitelist", "mov,matroska,webm,avi,wav,mp3,aac,flac,ogg,mpeg,mpegts,aiff",
+];
 
 pub struct FfmpegCli;
 
 impl FfmpegCli {
-    async fn run_binary(cmd: &mut Command, what: &str) -> Result<Vec<u8>> {
-        Self::output(cmd, what).await
-    }
-
     async fn run(cmd: &mut Command, what: &str) -> Result<String> {
         Self::output(cmd, what).await.map(|out| String::from_utf8_lossy(&out).to_string())
     }
 
-    /// stdout of a run that succeeded. A failure is logged with the end of
-    /// stderr, where ffmpeg says what went wrong.
+    /// Stdout of a successful run. Return stderr to the caller on failure.
     async fn output(cmd: &mut Command, what: &str) -> Result<Vec<u8>> {
         let started = std::time::Instant::now();
         let out = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).output().await {
             Ok(out) => out,
             Err(e) => {
                 let err = CoreError::Unavailable(format!("{what}: {e}"));
-                log_failure(what, started, None, "", Some(&err));
+                log_failure(what, started, None, Some(&err));
                 return Err(err);
             }
         };
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            log_failure(what, started, out.status.code(), &stderr, None);
+            log_failure(what, started, out.status.code(), None);
             return Err(CoreError::Other(format!(
                 "{what} failed: {}",
                 stderr.chars().take(800).collect::<String>()
@@ -168,14 +188,13 @@ impl FfmpegCli {
 
 /// An `ffmpeg_failed` line in the app log. A warning: some callers expect
 /// failures and carry on; the step that gives up logs the error.
-fn log_failure(what: &str, started: std::time::Instant, exit_code: Option<i32>, stderr: &str, error: Option<&CoreError>) {
+fn log_failure(what: &str, started: std::time::Instant, exit_code: Option<i32>, error: Option<&CoreError>) {
     crate::applog::write(
         crate::applog::Level::Warn,
         crate::applog::Event::FfmpegFailed {
             what: what.to_string(),
             exit_code,
             ms: started.elapsed().as_millis() as u64,
-            stderr_tail: crate::applog::Tail::new(stderr),
             error: error.map(crate::applog::ErrText::from),
         },
     );
@@ -190,14 +209,19 @@ fn stderr_tail(stderr: &str, n: usize) -> String {
 #[async_trait]
 impl VideoEngine for FfmpegCli {
     async fn probe(&self, file_path: &str) -> Result<Media> {
-        if !Path::new(file_path).exists() {
+        if !Path::new(file_path).is_file() {
             return Err(CoreError::NotFound(format!("file {file_path}")));
         }
+        let source = Path::new(file_path).canonicalize()?;
+        let file_path = source.to_str().ok_or_else(|| {
+            CoreError::InvalidArg("The source filename is not valid Unicode".into())
+        })?;
         let probe = ffprobe_path()
             .ok_or_else(|| CoreError::Unavailable("ffprobe not found (PATH, Homebrew, or FFPROBE_PATH)".into()))?;
         let mut cmd = Command::new(probe);
+        cmd.args(LOCAL_MEDIA_INPUT);
         cmd.args([
-            "-v", "error", "-print_format", "json", "-show_format", "-show_streams", file_path,
+            "-v", "error", "-print_format", "json", "-show_format", "-show_streams", "-i", file_path,
         ]);
         let stdout = Self::run(&mut cmd, "ffprobe").await?;
         let v: serde_json::Value = serde_json::from_str(&stdout)
@@ -206,18 +230,22 @@ impl VideoEngine for FfmpegCli {
         let video = streams
             .iter()
             .find(|s| s["codec_type"] == "video")
-            .ok_or_else(|| CoreError::InvalidArg("no video stream".into()))?;
+            .filter(|s| s["disposition"]["attached_pic"].as_u64() != Some(1))
+            .ok_or_else(|| CoreError::InvalidArg("Choose a source whose first video track contains footage".into()))?;
         let audio = streams.iter().find(|s| s["codec_type"] == "audio");
-        let fps = parse_rate(video["r_frame_rate"].as_str().unwrap_or("30/1"));
+        let fps = video["r_frame_rate"].as_str().and_then(parse_known_rate)
+            .ok_or_else(|| CoreError::InvalidArg("The source video has no usable frame rate".into()))?;
         let duration = v["format"]["duration"]
             .as_str()
             .and_then(|d| d.parse::<f64>().ok())
-            .unwrap_or(0.0);
+            .filter(|duration| duration.is_finite() && *duration > 0.0)
+            .ok_or_else(|| CoreError::InvalidArg("The source video has no usable duration".into()))?;
         Ok(Media {
             id: Uuid::new_v4(),
             file_path: file_path.to_string(),
             duration,
             frame_rate: fps,
+            average_frame_rate: video["avg_frame_rate"].as_str().and_then(parse_known_rate),
             width: video["width"].as_u64().unwrap_or(0) as u32,
             height: video["height"].as_u64().unwrap_or(0) as u32,
             audio_sample_rate: audio
@@ -225,6 +253,23 @@ impl VideoEngine for FfmpegCli {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(48000),
             codec: video["codec_name"].as_str().unwrap_or("unknown").to_string(),
+            source_timecode: video["tags"]["timecode"].as_str()
+                .or_else(|| streams.iter().filter(|stream| stream["codec_tag_string"] == "tmcd")
+                    .find_map(|stream| stream["tags"]["timecode"].as_str()))
+                .or_else(|| v["format"]["tags"]["timecode"].as_str())
+                .map(str::to_owned),
+            source_audio_channels: match audio {
+                Some(stream) => stream["channels"].as_u64().and_then(|n| u32::try_from(n).ok()),
+                None => Some(0),
+            },
+            source_audio_tracks: Some(streams.iter().filter(|stream| stream["codec_type"] == "audio").count()),
+            audio_streams: streams.iter().filter(|stream| stream["codec_type"] == "audio")
+                .filter_map(|stream| Some(crate::model::AudioStream {
+                    index: usize::try_from(stream["index"].as_u64()?).ok()?,
+                    channels: stream["channels"].as_u64().and_then(|value| u32::try_from(value).ok()),
+                    sample_rate: stream["sample_rate"].as_str().and_then(|value| value.parse().ok()),
+                    language: stream["tags"]["language"].as_str().map(str::to_owned),
+                })).collect(),
             imported_at: Utc::now(),
         })
     }
@@ -239,7 +284,7 @@ impl VideoEngine for FfmpegCli {
             if *seek > 0.0 {
                 cmd.args(["-ss", &format!("{seek:.3}")]);
             }
-            cmd.args(["-i", file]);
+            cmd.args(LOCAL_MEDIA_INPUT).args(["-i", file]);
         }
         cmd.args([
             "-filter_complex", &plan.filter, "-map", "[v]", "-map", "[a]",
@@ -252,7 +297,7 @@ impl VideoEngine for FfmpegCli {
             Ok(child) => child,
             Err(e) => {
                 let err = CoreError::Unavailable(format!("ffmpeg render: {e}"));
-                log_failure("ffmpeg render", started, None, "", Some(&err));
+                log_failure("ffmpeg render", started, None, Some(&err));
                 return Err(err);
             }
         };
@@ -280,7 +325,7 @@ impl VideoEngine for FfmpegCli {
         if !out.status.success() {
             // ffmpeg reports the cause last: keep the tail, not the head.
             let stderr = String::from_utf8_lossy(&out.stderr);
-            log_failure("ffmpeg render", started, out.status.code(), &stderr, None);
+            log_failure("ffmpeg render", started, out.status.code(), None);
             return Err(CoreError::Other(format!("ffmpeg render failed: {}", stderr_tail(&stderr, 800))));
         }
         crate::events::send(
@@ -290,12 +335,14 @@ impl VideoEngine for FfmpegCli {
         Ok(())
     }
 
-    async fn extract_audio_wav(&self, media: &Media, out_path: &str) -> Result<()> {
+    async fn extract_audio_wav(&self, media: &Media, out_path: &str, stream: Option<usize>) -> Result<()> {
         let mut cmd = ffmpeg_cmd()?;
+        let map = stream.map_or_else(|| "0:a:0".to_owned(), |index| format!("0:{index}"));
+        cmd.args(LOCAL_MEDIA_INPUT);
         cmd.args([
             // The first audio track (OBS's track 1), like the render and the
             // preview copy; ffmpeg's own pick is the track with most channels.
-            "-y", "-i", &media.file_path, "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000",
+            "-y", "-i", &media.file_path, "-map", &map, "-vn", "-ac", "1", "-ar", "16000",
             "-c:a", "pcm_s16le", out_path,
         ]);
         Self::run(&mut cmd, "ffmpeg audio extract").await?;
@@ -304,6 +351,7 @@ impl VideoEngine for FfmpegCli {
 
     async fn extract_frame(&self, media: &Media, at: f64, width: u32, out_path: &str) -> Result<()> {
         let mut cmd = ffmpeg_cmd()?;
+        cmd.args(LOCAL_MEDIA_INPUT);
         cmd.args([
             "-y", "-ss", &format!("{:.3}", at.max(0.0)), "-i", &media.file_path,
             "-frames:v", "1", "-vf", &format!("scale={width}:-2"), out_path,
@@ -312,45 +360,59 @@ impl VideoEngine for FfmpegCli {
         Ok(())
     }
 
-    async fn media_assets(&self, media: &Media) -> Result<MediaAssets> {
+    async fn media_assets(&self, media: &Media, stream: Option<usize>) -> Result<MediaAssets> {
         // Cache by file identity (path + size + mtime), NOT media id: every
         // project pointing at the same footage — duplicates, re-imports,
         // MCP-created projects — shares one set of peaks/thumbnails.
-        let cache = crate::store::data_dir().join("cache").join(asset_cache_key(media));
-        std::fs::create_dir_all(&cache)?;
+        let source_key = asset_cache_key(media);
+        let cache = media_cache_directory(&source_key)?;
 
         // ---- waveform peaks (u8 per 1/PEAKS_PER_SECOND s) -------------------
-        let peaks_file = cache.join("peaks.bin");
-        if !peaks_file.is_file() {
-            let raw = decode_raw_peaks(&media.file_path).await?;
-            // Raw levels persist for ANALYSIS (silence detection needs real
-            // energy); the display copy is normalized for visibility.
-            std::fs::write(cache.join("peaks_raw.bin"), &raw)?;
-            let mut peaks = raw;
-            normalize_peaks(&mut peaks);
-            std::fs::write(&peaks_file, &peaks)?;
+        let audio_cache = media_cache_directory(&playback_cache_key(media, stream))?;
+        let peaks_file = audio_cache.join("peaks.bin");
+        let has_audio = media.source_audio_tracks != Some(0);
+        if has_audio && !valid_waveform_file(&peaks_file, media.duration) {
+            if let Some(mut peaks) = load_stream_peaks(media, stream).await {
+                normalize_peaks(&mut peaks);
+                write_waveform_cache(&audio_cache, &peaks_file, &peaks)?;
+            }
         }
 
         // ---- thumbnail filmstrip --------------------------------------------
-        // Interval scales with duration: ~1 thumb per 1-10s, max ~240 frames.
-        let interval = (media.duration / 240.0).clamp(1.0, 10.0);
-        let first = cache.join("thumb_0001.jpg");
-        if !first.is_file() {
+        const MAX_THUMBNAILS: usize = 240;
+        let interval = (media.duration / MAX_THUMBNAILS as f64).max(1.0);
+        let filmstrip = cache.join("filmstrip-240");
+        if !filmstrip.symlink_metadata().is_ok_and(|metadata| metadata.is_dir()) {
+            let staging = tempfile::tempdir_in(&cache)?;
+            let frames = staging.path().join("filmstrip");
+            std::fs::create_dir(&frames)?;
             let mut cmd = ffmpeg_cmd()?;
+            cmd.args(LOCAL_MEDIA_INPUT);
             cmd.args([
                 "-y",
-                "-hwaccel", "auto",
+                "-threads", "2",
                 "-i", &media.file_path,
+                "-map", "0:v:0",
+                "-filter_threads", "1",
                 "-vf", &format!("fps=1/{interval},scale=160:-2"),
+                "-frames:v", &MAX_THUMBNAILS.to_string(),
                 "-q:v", "7",
-                &cache.join("thumb_%04d.jpg").to_string_lossy(),
+                &frames.join("thumb_%04d.jpg").to_string_lossy(),
             ]);
-            Self::run(&mut cmd, "ffmpeg thumbnails").await?;
+            let generated = Self::run(&mut cmd, "ffmpeg thumbnails").await;
+            if asset_cache_key(media) != source_key {
+                return Err(CoreError::Unavailable("The source changed while preparing thumbnails".into()));
+            }
+            if generated.is_ok() {
+                if let Err(error) = std::fs::rename(&frames, &filmstrip) {
+                    if !filmstrip.symlink_metadata().is_ok_and(|metadata| metadata.is_dir()) { return Err(error.into()); }
+                }
+            }
         }
         let mut thumbnails = vec![];
-        for i in 1.. {
-            let path = cache.join(format!("thumb_{i:04}.jpg"));
-            if !path.is_file() {
+        for i in 1..=MAX_THUMBNAILS {
+            let path = filmstrip.join(format!("thumb_{i:04}.jpg"));
+            if !path.symlink_metadata().is_ok_and(|metadata| metadata.is_file()) {
                 break;
             }
             thumbnails.push(ThumbnailRef {
@@ -361,11 +423,15 @@ impl VideoEngine for FfmpegCli {
         // Playable copy if a PREVIOUS remux produced one. Building a missing
         // one is slow on multi-GB sources — the engine kicks that off in the
         // background (ensure_playable_copy) so peaks/thumbnails return now.
-        let playback_path = playable_copy_path(media);
-        let playback_error = if playback_path.is_none() { playable_copy_failure(media) } else { None };
+        let playback_path = playable_stream_path(media, stream);
+        let playback_error = if playback_path.is_none() { playable_stream_failure(media, stream) } else { None };
 
+        if asset_cache_key(media) != source_key {
+            return Err(CoreError::Unavailable("The source changed while preparing timeline assets".into()));
+        }
         Ok(MediaAssets {
-            peaks_path: Some(peaks_file.to_string_lossy().into_owned()),
+            peaks_path: (has_audio && valid_waveform_file(&peaks_file, media.duration))
+                .then(|| peaks_file.to_string_lossy().into_owned()),
             peaks_per_second: PEAKS_PER_SECOND,
             thumbnails,
             playback_path,
@@ -376,8 +442,26 @@ impl VideoEngine for FfmpegCli {
 
 /// The preview copy, if one was already built for this source.
 pub fn playable_copy_path(media: &Media) -> Option<String> {
-    let play = crate::store::data_dir().join("cache").join(asset_cache_key(media)).join("play.mp4");
-    play.is_file().then(|| play.to_string_lossy().into_owned())
+    playable_stream_path(media, None)
+}
+
+pub fn playable_stream_path(media: &Media, stream: Option<usize>) -> Option<String> {
+    let play = media_cache_directory(&playback_cache_key(media, stream)).ok()?.join("play.mp4");
+    play.symlink_metadata().is_ok_and(|metadata| metadata.is_file()).then(|| play.to_string_lossy().into_owned())
+}
+
+fn media_cache_directory(key: &str) -> Result<PathBuf> {
+    let root = crate::store::data_dir().join("cache");
+    std::fs::create_dir_all(&root)?;
+    let cache = root.join(key);
+    if !root.symlink_metadata()?.is_dir() {
+        return Err(CoreError::Storage("Media cache must be a real directory".into()));
+    }
+    std::fs::create_dir_all(&cache)?;
+    if !cache.symlink_metadata()?.is_dir() {
+        return Err(CoreError::Storage("Media cache entry must be a real directory".into()));
+    }
+    Ok(cache)
 }
 
 /// Preview copies that failed in this run, by cache key, with the reason.
@@ -391,7 +475,16 @@ fn playable_failures() -> &'static std::sync::Mutex<std::collections::HashMap<St
 
 /// Why this source's preview copy failed in this run, if it did.
 pub fn playable_copy_failure(media: &Media) -> Option<String> {
-    playable_failures().lock().unwrap().get(&asset_cache_key(media)).cloned()
+    playable_stream_failure(media, None)
+}
+
+pub fn playable_stream_failure(media: &Media, stream: Option<usize>) -> Option<String> {
+    playable_failures().lock().unwrap().get(&playback_cache_key(media, stream)).cloned()
+}
+
+fn playback_cache_key(media: &Media, stream: Option<usize>) -> String {
+    let base = asset_cache_key(media);
+    stream.map_or_else(|| base.clone(), |index| format!("{base}-audio-{index}"))
 }
 
 /// Build the web-playable copy when the source needs one: audio WebKit can't
@@ -406,45 +499,60 @@ pub fn playable_copy_failure(media: &Media) -> Option<String> {
 /// and returned again instead of re-running ffmpeg. Only the preview uses the
 /// copy: transcription, render and export read the original through ffmpeg.
 pub async fn ensure_playable_copy(media: &Media) -> Result<Option<String>> {
-    if let Some(play) = playable_copy_path(media) {
+    ensure_playable_stream(media, None).await
+}
+
+pub async fn ensure_playable_stream(media: &Media, stream: Option<usize>) -> Result<Option<String>> {
+    if let Some(play) = playable_stream_path(media, stream) {
         return Ok(Some(play));
     }
-    if let Some(reason) = playable_copy_failure(media) {
+    if let Some(reason) = playable_stream_failure(media, stream) {
         return Err(CoreError::Other(reason));
     }
-    let result = build_playable_copy(media).await;
+    let result = build_playable_copy(media, stream).await;
     if let Err(e) = &result {
-        playable_failures().lock().unwrap().insert(asset_cache_key(media), e.to_string());
+        playable_failures().lock().unwrap().insert(playback_cache_key(media, stream), e.to_string());
     }
     result
 }
 
-async fn build_playable_copy(media: &Media) -> Result<Option<String>> {
-    let Some(fix) = playable_fix(&container_info(&media.file_path).await?) else {
+async fn build_playable_copy(media: &Media, stream: Option<usize>) -> Result<Option<String>> {
+    let info = container_info(&media.file_path).await?;
+    let fix = if stream.is_some() {
+        let hevc = info.video_codec.as_deref() == Some("hevc");
+        Some(PlayableFix { reencode_video: !matches!(info.video_codec.as_deref(), Some("h264" | "hevc")), tag_hvc1: hevc, audio: AudioFix::StereoAac })
+    } else {
+        playable_fix(&info)
+    };
+    let Some(fix) = fix else {
         return Ok(None);
     };
-    let cache = crate::store::data_dir().join("cache").join(asset_cache_key(media));
-    std::fs::create_dir_all(&cache)?;
+    let key = playback_cache_key(media, stream);
+    let cache = media_cache_directory(&key)?;
     let play = cache.join("play.mp4");
     // One copy per cache key at a time (RAII: released even on panic).
     static IN_FLIGHT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
         std::sync::OnceLock::new();
     let set = IN_FLIGHT.get_or_init(Default::default);
-    let Some(_claim) = crate::inflight::try_claim(set, asset_cache_key(media)) else {
+    let Some(_claim) = crate::inflight::try_claim(set, key.clone()) else {
         return Ok(None); // someone else is building it; caller retries later
     };
-    if play.is_file() {
+    if play.symlink_metadata().is_ok_and(|metadata| metadata.is_file()) {
         return Ok(Some(play.to_string_lossy().into_owned())); // built while we probed
     }
-    let part = cache.join("play.mp4.part");
+    let staging = tempfile::tempdir_in(&cache)?;
+    let part = staging.path().join("play.mp4");
     let mut cmd = ffmpeg_cmd()?;
-    cmd.args(["-hide_banner", "-v", "error", "-y", "-i", &media.file_path]);
-    cmd.args(playable_args(&fix));
+    cmd.args(LOCAL_MEDIA_INPUT)
+        .args(["-hide_banner", "-v", "error", "-y", "-i", &media.file_path]);
+    let stream_map = stream.map(|index| format!("0:{index}"));
+    cmd.args(playable_args(&fix).into_iter().map(|arg| {
+        if arg == "0:a:0?" { stream_map.as_deref().unwrap_or(arg) } else { arg }
+    }));
     cmd.arg(&part);
-    if let Err(e) = FfmpegCli::run(&mut cmd, "ffmpeg playable copy").await {
-        // A re-encode's partial output can be gigabytes.
-        let _ = std::fs::remove_file(&part);
-        return Err(e);
+    FfmpegCli::run(&mut cmd, "ffmpeg playable copy").await?;
+    if playback_cache_key(media, stream) != key {
+        return Err(CoreError::Unavailable("The source changed while preparing playback. Reopen the source and try again.".into()));
     }
     std::fs::rename(&part, &play)?;
     Ok(Some(play.to_string_lossy().into_owned()))
@@ -496,11 +604,12 @@ async fn container_info(path: &str) -> Result<ContainerInfo> {
     let probe = ffprobe_path()
         .ok_or_else(|| CoreError::Unavailable("ffprobe not found".into()))?;
     let mut cmd = Command::new(probe);
+    cmd.args(LOCAL_MEDIA_INPUT);
     cmd.args([
         "-v", "error",
         "-show_entries", "format=format_name:stream=codec_type,codec_name,codec_tag_string,channels",
         "-of", "json",
-        path,
+        "-i", path,
     ]);
     let out = FfmpegCli::run(&mut cmd, "ffprobe container").await?;
     parse_container_info(&out)
@@ -595,22 +704,32 @@ pub async fn concat_media(paths: &[String]) -> Result<String> {
     if paths.len() < 2 {
         return Err(CoreError::InvalidArg("pick at least two files to join".into()));
     }
+    let paths = paths.iter().map(|path| {
+        let canonical = Path::new(path).canonicalize()?;
+        canonical.into_os_string().into_string().map_err(|_| {
+            CoreError::InvalidArg("The source filename is not valid Unicode".into())
+        })
+    }).collect::<Result<Vec<_>>>()?;
     let ffprobe = ffprobe_path()
         .ok_or_else(|| CoreError::Unavailable("ffprobe not found".into()))?;
     let mut cmd = ffmpeg_cmd()?;
     let mut signature: Option<String> = None;
     let mut all_mp4 = true;
-    for p in paths {
+    for p in &paths {
+        if p.contains(['\r', '\n']) {
+            return Err(CoreError::InvalidArg("Concatenation filenames cannot contain line breaks".into()));
+        }
         if !Path::new(p).is_file() {
             return Err(CoreError::NotFound(format!("file {p}")));
         }
         let mut probe = Command::new(&ffprobe);
+        probe.args(LOCAL_MEDIA_INPUT);
         probe.args([
             "-v", "error",
             "-show_entries",
             "format=format_name:stream=codec_type,codec_name,width,height,channels,sample_rate",
             "-of", "json",
-            p,
+            "-i", p,
         ]);
         let out = FfmpegCli::run(&mut probe, "ffprobe streams").await?;
         let (is_mp4, sig) = join_signature(&out)
@@ -629,36 +748,31 @@ pub async fn concat_media(paths: &[String]) -> Result<String> {
     }
     let dir = crate::store::data_dir().join("media");
     std::fs::create_dir_all(&dir)?;
-    // The random suffix keeps two joins in the same second from writing the
-    // same file (ffmpeg runs with -y; the first may be another project's media).
+    let extension = if all_mp4 { "mp4" } else { "mkv" };
     let out = dir.join(format!(
         "joined-{}-{}.{}",
         chrono::Local::now().format("%Y%m%d-%H%M%S"),
-        &Uuid::new_v4().simple().to_string()[..8],
-        if all_mp4 { "mp4" } else { "mkv" },
+        Uuid::new_v4().simple(),
+        extension,
     ));
-    let list_path = std::env::temp_dir().join(format!(
-        "roughcut-concat-{}.txt",
-        uuid::Uuid::new_v4().simple()
-    ));
+    let staging = tempfile::tempdir_in(&dir)?;
+    let list_path = staging.path().join("sources.txt");
+    let staged_output = staging.path().join(format!("joined.{extension}"));
     let list: String = paths
         .iter()
         .map(|p| format!("file '{}'\n", p.replace('\'', "'\\''")))
         .collect();
     std::fs::write(&list_path, list)?;
-    cmd.args(["-hide_banner", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i"])
+    cmd.args(["-hide_banner", "-v", "error", "-y", "-protocol_whitelist", "file", "-f", "concat", "-safe", "0", "-i"])
         .arg(&list_path)
         .args(["-map", "0:v:0", "-map", "0:a:0?", "-c", "copy"]);
     if all_mp4 {
         cmd.args(["-movflags", "+faststart"]);
     }
-    cmd.arg(&out).stdin(Stdio::null());
-    let result = FfmpegCli::run(&mut cmd, "ffmpeg join").await;
-    let _ = std::fs::remove_file(&list_path);
-    if let Err(e) = result {
-        let _ = std::fs::remove_file(&out);
-        return Err(e);
-    }
+    cmd.arg(&staged_output).stdin(Stdio::null()).kill_on_drop(true);
+    FfmpegCli::run(&mut cmd, "ffmpeg join").await?;
+    std::fs::File::open(&staged_output)?.sync_all()?;
+    std::fs::rename(&staged_output, &out)?;
     Ok(out.to_string_lossy().into_owned())
 }
 
@@ -684,46 +798,34 @@ fn join_signature(json: &str) -> Option<(bool, String)> {
     Some((is_mp4, format!("{video} + {audio}")))
 }
 
-/// Stable identity for derived assets: hash of path + size + mtime, so the
-/// cache survives re-imports and invalidates when the file changes.
+/// Cache key for derived assets. Include the source metadata at its full
+/// precision and the filesystem identity where available.
 pub fn asset_cache_key(media: &Media) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    hasher.update(b"v4:"); // peaks floor 4 + capture gain era // peaks normalization — regenerate older assets
+    hasher.update(b"v5:");
     hasher.update(media.file_path.as_bytes());
     if let Ok(meta) = std::fs::metadata(&media.file_path) {
         hasher.update(meta.len().to_le_bytes());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            hasher.update(meta.dev().to_le_bytes());
+            hasher.update(meta.ino().to_le_bytes());
+            hasher.update(meta.ctime().to_le_bytes());
+            hasher.update(meta.ctime_nsec().to_le_bytes());
+        }
         if let Ok(modified) = meta.modified() {
             if let Ok(d) = modified.duration_since(std::time::UNIX_EPOCH) {
                 hasher.update(d.as_secs().to_le_bytes());
+                hasher.update(d.subsec_nanos().to_le_bytes());
             }
         }
     }
     format!("{:x}", hasher.finalize())[..16].to_string()
 }
 
-/// Max |sample| per bucket, scaled to u8 — RAW levels, no normalization
-/// (analysis wants real energy, not display scaling). Pure.
-pub fn raw_peaks(pcm_s16le: &[u8], sample_rate: u32, peaks_per_second: u32) -> Vec<u8> {
-    let bucket = (sample_rate / peaks_per_second).max(1) as usize;
-    let mut peaks = Vec::with_capacity(pcm_s16le.len() / 2 / bucket + 1);
-    let mut max: i32 = 0;
-    let mut n = 0usize;
-    for chunk in pcm_s16le.chunks_exact(2) {
-        let s = i16::from_le_bytes([chunk[0], chunk[1]]) as i32;
-        max = max.max(s.abs());
-        n += 1;
-        if n == bucket {
-            peaks.push(((max * 255) / 32768).min(255) as u8);
-            max = 0;
-            n = 0;
-        }
-    }
-    if n > 0 {
-        peaks.push(((max * 255) / 32768).min(255) as u8);
-    }
-    peaks
-}
+pub use super::waveform::raw_peaks;
 
 /// Normalize toward the file's own loudest moment: a quiet laptop mic
 /// otherwise renders as a flat line. Floor of 4 (~1.5%) — live capture
@@ -746,40 +848,100 @@ pub fn compute_peaks(pcm_s16le: &[u8], sample_rate: u32, peaks_per_second: u32) 
 
 /// Decode mono PCM and bucket to raw u8 peaks.
 pub async fn decode_raw_peaks(file_path: &str) -> Result<Vec<u8>> {
+    decode_stream_peaks(file_path, None).await
+}
+
+async fn decode_stream_peaks(file_path: &str, stream: Option<usize>) -> Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
     const RATE: u32 = 8000;
+    const CHUNK: usize = (RATE / PEAKS_PER_SECOND) as usize * 2 * 100;
+    let map = stream.map_or_else(|| "0:a:0".to_owned(), |index| format!("0:{index}"));
     let mut cmd = ffmpeg_cmd()?;
+    cmd.args(LOCAL_MEDIA_INPUT);
     cmd.args([
-        // The first audio track, as transcription and the render use.
-        "-i", file_path, "-map", "0:a:0", "-vn", "-ac", "1", "-ar", &RATE.to_string(), "-f",
+        "-v", "error", "-i", file_path, "-map", &map, "-vn", "-ac", "1", "-ar", &RATE.to_string(), "-f",
         "s16le", "pipe:1",
     ]);
-    let pcm = FfmpegCli::run_binary(&mut cmd, "ffmpeg peaks decode").await?;
-    Ok(raw_peaks(&pcm, RATE, PEAKS_PER_SECOND))
+    let mut child = cmd.kill_on_drop(true).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let mut stdout = child.stdout.take().ok_or_else(|| CoreError::Unavailable("FFmpeg audio output is unavailable".into()))?;
+    let collect = async {
+        let mut buffer = vec![0; CHUNK];
+        let mut filled = 0;
+        let mut peaks = Vec::new();
+        loop {
+            let read = stdout.read(&mut buffer[filled..]).await?;
+            if read == 0 {
+                peaks.extend(raw_peaks(&buffer[..filled], RATE, PEAKS_PER_SECOND));
+                return Ok::<_, std::io::Error>(peaks);
+            }
+            filled += read;
+            if filled == buffer.len() {
+                peaks.extend(raw_peaks(&buffer, RATE, PEAKS_PER_SECOND));
+                filled = 0;
+            }
+        }
+    };
+    let (peaks, output) = tokio::try_join!(collect, child.wait_with_output())?;
+    if !output.status.success() {
+        return Err(CoreError::Unavailable(format!("FFmpeg could not decode source audio ({})", output.status)));
+    }
+    Ok(peaks)
 }
 
 /// Raw analysis peaks for `media`, from cache or a one-off decode (caches
 /// that predate raw peaks get backfilled). None = no ffmpeg/decoder.
 pub async fn load_raw_peaks(media: &Media) -> Option<Vec<u8>> {
-    let cache = crate::store::data_dir().join("cache").join(asset_cache_key(media));
+    load_stream_peaks(media, None).await
+}
+
+pub async fn load_stream_peaks(media: &Media, stream: Option<usize>) -> Option<Vec<u8>> {
+    let key = playback_cache_key(media, stream);
+    let cache = media_cache_directory(&key).ok()?;
     let raw_file = cache.join("peaks_raw.bin");
-    if let Ok(bytes) = std::fs::read(&raw_file) {
-        return Some(bytes);
+    if valid_waveform_file(&raw_file, media.duration) {
+        if let (Some(limit), Ok(file)) = (waveform_size_limit(media.duration), std::fs::File::open(&raw_file)) {
+            let mut bytes = Vec::new();
+            if file.take(limit.saturating_add(1)).read_to_end(&mut bytes).is_ok()
+                && (1..=limit).contains(&(bytes.len() as u64))
+            {
+                return Some(bytes);
+            }
+        }
     }
-    let raw = decode_raw_peaks(&media.file_path).await.ok()?;
-    let _ = std::fs::create_dir_all(&cache);
-    let _ = std::fs::write(&raw_file, &raw);
+    let raw = decode_stream_peaks(&media.file_path, stream).await.ok()?;
+    if playback_cache_key(media, stream) != key {
+        return None;
+    }
+    let _ = write_waveform_cache(&cache, &raw_file, &raw);
     Some(raw)
 }
 
-fn parse_rate(s: &str) -> f64 {
+fn valid_waveform_file(path: &Path, duration: f64) -> bool {
+    let Some(max_bytes) = waveform_size_limit(duration) else { return false; };
+    path.symlink_metadata().is_ok_and(|metadata| {
+        metadata.is_file() && (1..=max_bytes).contains(&metadata.len())
+    })
+}
+
+fn waveform_size_limit(duration: f64) -> Option<u64> {
+    (duration.is_finite() && duration > 0.0)
+        .then(|| ((duration + 2.0) * f64::from(PEAKS_PER_SECOND)).ceil() as u64)
+}
+
+fn write_waveform_cache(cache: &Path, path: &Path, data: &[u8]) -> std::io::Result<()> {
+    std::fs::create_dir_all(cache)?;
+    let mut file = tempfile::NamedTempFile::new_in(cache)?;
+    file.write_all(data)?;
+    file.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+fn parse_known_rate(s: &str) -> Option<f64> {
     let mut it = s.splitn(2, '/');
-    let num: f64 = it.next().and_then(|n| n.parse().ok()).unwrap_or(30.0);
-    let den: f64 = it.next().and_then(|n| n.parse().ok()).unwrap_or(1.0);
-    if den == 0.0 {
-        30.0
-    } else {
-        num / den
-    }
+    let num: f64 = it.next()?.parse().ok()?;
+    let den: f64 = it.next().unwrap_or("1").parse().ok()?;
+    let rate = num / den;
+    (den > 0.0 && rate.is_finite() && rate > 0.0).then_some(rate)
 }
 
 /// Demo-mode engine: fabricates plausible metadata, refuses to render.
@@ -793,10 +955,15 @@ impl VideoEngine for MockVideoEngine {
             file_path: file_path.to_string(),
             duration: 300.0,
             frame_rate: 30.0,
+            average_frame_rate: None,
             width: 3840,
             height: 2160,
             audio_sample_rate: 48000,
+            source_audio_channels: None,
+            source_audio_tracks: None,
+            audio_streams: vec![],
             codec: "h264 (demo)".into(),
+            source_timecode: None,
             imported_at: Utc::now(),
         })
     }
@@ -807,7 +974,7 @@ impl VideoEngine for MockVideoEngine {
         ))
     }
 
-    async fn extract_audio_wav(&self, _m: &Media, _o: &str) -> Result<()> {
+    async fn extract_audio_wav(&self, _m: &Media, _o: &str, _stream: Option<usize>) -> Result<()> {
         Err(CoreError::Unavailable("audio extraction needs ffmpeg on PATH".into()))
     }
 
@@ -815,7 +982,7 @@ impl VideoEngine for MockVideoEngine {
         Err(CoreError::Unavailable("frame grabs need ffmpeg on PATH (demo mode active)".into()))
     }
 
-    async fn media_assets(&self, _media: &Media) -> Result<MediaAssets> {
+    async fn media_assets(&self, _media: &Media, _stream: Option<usize>) -> Result<MediaAssets> {
         // No real audio/video to derive from — the frontend falls back to its
         // synthetic waveform.
         Ok(MediaAssets {
@@ -850,11 +1017,11 @@ impl VideoEngine for AutoVideoEngine {
         }
     }
 
-    async fn extract_audio_wav(&self, media: &Media, out_path: &str) -> Result<()> {
+    async fn extract_audio_wav(&self, media: &Media, out_path: &str, stream: Option<usize>) -> Result<()> {
         if crate::capabilities::probe().media_ready() {
-            FfmpegCli.extract_audio_wav(media, out_path).await
+            FfmpegCli.extract_audio_wav(media, out_path, stream).await
         } else {
-            MockVideoEngine.extract_audio_wav(media, out_path).await
+            MockVideoEngine.extract_audio_wav(media, out_path, stream).await
         }
     }
 
@@ -866,11 +1033,11 @@ impl VideoEngine for AutoVideoEngine {
         }
     }
 
-    async fn media_assets(&self, media: &Media) -> Result<MediaAssets> {
+    async fn media_assets(&self, media: &Media, stream: Option<usize>) -> Result<MediaAssets> {
         if crate::capabilities::probe().media_ready() {
-            FfmpegCli.media_assets(media).await
+            FfmpegCli.media_assets(media, stream).await
         } else {
-            MockVideoEngine.media_assets(media).await
+            MockVideoEngine.media_assets(media, stream).await
         }
     }
 }
@@ -983,7 +1150,7 @@ fn render_plan(job: &RenderJob<'_>) -> Result<RenderPlan> {
     for (k, group) in groups.iter().enumerate() {
         let spans: Vec<PlaySpan> = group.iter().flat_map(|&i| pieces[i].iter().copied()).collect();
         let m = spans.len();
-        let (audio_graph, audio_srcs) = audio_sources(job.audio_offset_s, k, m);
+        let (audio_graph, audio_srcs) = audio_sources(job.audio_offset_s, k, m, job.audio_stream_index);
         filter.push_str(&audio_graph);
         // Video source per span: raw camera, or the composed frame.
         let video_srcs: Vec<String> = match compositing {
@@ -1107,15 +1274,16 @@ fn composite_graph(
 /// exactly one filter: reusing it once per span makes ffmpeg feed every span
 /// after the first audio from the wrong place. So it is `asplit` into one copy
 /// per span. A raw input like `[0:a]` may be read any number of times.
-fn audio_sources(audio_offset_s: f64, input: usize, spans: usize) -> (String, Vec<String>) {
+fn audio_sources(audio_offset_s: f64, input: usize, spans: usize, stream: Option<usize>) -> (String, Vec<String>) {
+    let source = stream.map_or_else(|| format!("[{input}:a]"), |index| format!("[{input}:{index}]"));
     if audio_offset_s.abs() <= 0.001 {
-        return (String::new(), vec![format!("[{input}:a]"); spans]);
+        return (String::new(), vec![source; spans]);
     }
     let mut graph = if audio_offset_s > 0.0 {
         let ms = (audio_offset_s * 1000.0).round() as i64;
-        format!("[{input}:a]adelay={ms}:all=1[ash{input}];")
+        format!("{source}adelay={ms}:all=1[ash{input}];")
     } else {
-        format!("[{input}:a]atrim=start={:.3},asetpts=PTS-STARTPTS[ash{input}];", -audio_offset_s)
+        format!("{source}atrim=start={:.3},asetpts=PTS-STARTPTS[ash{input}];", -audio_offset_s)
     };
     let labels: Vec<String> = (0..spans).map(|i| format!("[as{input}_{i}]")).collect();
     graph.push_str(&format!("[ash{input}]asplit={}{};", spans, labels.concat()));
@@ -1130,20 +1298,20 @@ mod tests {
     #[test]
     fn shifted_audio_is_split_so_every_span_reads_its_own_copy() {
         // No offset: every span reads the raw input, nothing to split.
-        let (graph, srcs) = audio_sources(0.0, 0, 3);
+        let (graph, srcs) = audio_sources(0.0, 0, 3, None);
         assert!(graph.is_empty());
         assert_eq!(srcs, vec!["[0:a]"; 3]);
 
         // With an offset each span gets a distinct label from one asplit —
         // a filter output label can be consumed only once.
         for offset in [0.2, -0.15] {
-            let (graph, srcs) = audio_sources(offset, 1, 3);
+            let (graph, srcs) = audio_sources(offset, 1, 3, None);
             assert!(graph.contains("[ash1]asplit=3[as1_0][as1_1][as1_2];"), "{graph}");
             assert_eq!(srcs, vec!["[as1_0]", "[as1_1]", "[as1_2]"]);
             assert_eq!(graph.matches("[ash1]").count(), 2, "produced once, read once: {graph}");
         }
-        assert!(audio_sources(0.2, 0, 1).0.contains("[0:a]adelay=200"));
-        assert!(audio_sources(-0.15, 0, 1).0.contains("atrim=start=0.150"));
+        assert!(audio_sources(0.2, 0, 1, None).0.contains("[0:a]adelay=200"));
+        assert!(audio_sources(-0.15, 0, 1, None).0.contains("atrim=start=0.150"));
     }
 
     fn media(path: &str) -> Media {
@@ -1152,10 +1320,15 @@ mod tests {
             file_path: path.into(),
             duration: 3600.0,
             frame_rate: 30.0,
+            average_frame_rate: None,
             width: 1920,
             height: 1080,
             audio_sample_rate: 48000,
+            source_audio_channels: None,
+            source_audio_tracks: None,
+            audio_streams: vec![],
             codec: "h264".into(),
+            source_timecode: None,
             imported_at: chrono::Utc::now(),
         }
     }
@@ -1165,7 +1338,7 @@ mod tests {
     }
 
     fn job<'a>(m: &'a Media, pieces: &'a [Vec<PlaySpan>], offset: f64) -> RenderJob<'a> {
-        RenderJob { media: m, pieces, out_path: "/tmp/out.mp4", audio_offset_s: offset, screen: None, vertical_crop: None }
+        RenderJob { media: m, pieces, out_path: "/tmp/out.mp4", audio_offset_s: offset, audio_stream_index: None, screen: None, vertical_crop: None }
     }
 
     #[test]

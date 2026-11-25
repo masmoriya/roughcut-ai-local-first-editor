@@ -5,7 +5,8 @@
 
 export type { Media } from "./generated/Media";
 export type { Word } from "./generated/Word";
-export type { TranscriptSegment } from "./generated/TranscriptSegment";
+import type { TranscriptSegment as GeneratedTranscriptSegment } from "./generated/TranscriptSegment";
+export type TranscriptSegment = GeneratedTranscriptSegment & { speaker?: string };
 export type { Transcript } from "./generated/Transcript";
 export type { Clip } from "./generated/Clip";
 export type { ClipOrigin } from "./generated/ClipOrigin";
@@ -14,15 +15,48 @@ export type { Timeline } from "./generated/Timeline";
 export type { EditOp } from "./generated/EditOp";
 export type { EditAction } from "./generated/EditAction";
 export type { ActionSource } from "./generated/ActionSource";
-export type { Project } from "./generated/Project";
-export type { ProjectSummary } from "./generated/ProjectSummary";
-export type { Preferences } from "./generated/Preferences";
+import type { Project as GeneratedProject } from "./generated/Project";
+import type { SourceRange } from "./generated/SourceRange";
+export interface ResolveTimelineBinding {
+  timeline: {
+    timeline_name: string;
+    start_timecode: string;
+    rate_num: number;
+    rate_den: number;
+  };
+  dialogue_stream_index: number;
+}
+
+export type Project = GeneratedProject & {
+  protected_ranges?: SourceRange[];
+  resolve_timeline?: ResolveTimelineBinding;
+};
+import type { Preferences as GeneratedPreferences } from "./generated/Preferences";
+export interface SavedRuleSet {
+  name: string;
+  custom_filler_words: string[];
+  profanity_phrases: string[];
+  keyword_phrases: string[];
+  never_cut_phrases: string[];
+}
+export type Preferences = GeneratedPreferences & {
+  profanity_phrases?: string[];
+  keyword_phrases?: string[];
+  never_cut_phrases?: string[];
+  saved_rule_sets?: SavedRuleSet[];
+};
 export type { Aggressiveness } from "./generated/Aggressiveness";
 export type { MediaAssets } from "./generated/MediaAssets";
 export type { Layout } from "./generated/Layout";
 export type { CutSuggestion } from "./generated/CutSuggestion";
-export type { CutProposal } from "./generated/CutProposal";
-export type { ProposedCut } from "./generated/ProposedCut";
+import type { CutProposal as GeneratedCutProposal } from "./generated/CutProposal";
+export type CutProposal = Omit<GeneratedCutProposal, "cuts"> & { cuts: ProposedCut[]; transcript_id?: string };
+import type { ProposedCut as GeneratedProposedCut } from "./generated/ProposedCut";
+export type ProposedCut = GeneratedProposedCut & {
+  rule_category?: "fillers" | "profanity" | "keywords" | "search";
+  min_word_confidence?: number;
+  phrase_matches?: { match_id: string; source_in_frame: number; source_out_frame: number }[];
+};
 export type { HistoryEntry } from "./generated/HistoryEntry";
 export type { History } from "./generated/History";
 export type { ThumbnailRef } from "./generated/ThumbnailRef";
@@ -46,7 +80,11 @@ import type { Clip } from "./generated/Clip";
 import type { EditAction } from "./generated/EditAction";
 import type { ModelMode } from "./generated/ModelMode";
 import type { RouteReason } from "./generated/RouteReason";
-import type { ProjectSummary } from "./generated/ProjectSummary";
+import type { ProjectSummary as GeneratedProjectSummary } from "./generated/ProjectSummary";
+export type ProjectSummary = GeneratedProjectSummary & {
+  source_filename?: string | null;
+  source_duration?: number | null;
+};
 import type { Timeline } from "./generated/Timeline";
 
 // ---------------------------------------------------------------------------
@@ -109,7 +147,7 @@ export interface TerminalExitEvent { id: string; code: number | null }
 // ---------------------------------------------------------------------------
 
 export type ExportTarget =
-  | "premiere_xml" | "fcp_xml" | "resolve_xml" | "edl" | "otio" | "mp4" | "srt" | "txt";
+  | "premiere_xml" | "fcp_xml" | "resolve_xml" | "resolve_manifest" | "edl" | "otio" | "mp4" | "srt" | "txt" | "transcript_json";
 
 // Shell-command status shapes are GENERATED (same regime as the model
 // types — ADR-0003 extended to the provisioning surface).
@@ -161,6 +199,17 @@ export interface ApplyProposalResult {
   cut_count: number; included_duration_s: number;
 }
 export interface InstructionResult { actions: EditAction[]; summary: string }
-export interface ExportResult { path: string }
+export interface ExportResult {
+  path: string;
+  resolve_timeline?: {
+    name: string;
+    source_path: string | null;
+    source_fingerprint: string | null;
+    timeline_frames: number;
+    xml_sha256: string;
+    cut_plan_version: string;
+    manifest: string;
+  };
+}
 export interface ListProjectsResult { projects: ProjectSummary[]; trash: ProjectSummary[] }
 export interface ToolError { code: string; message: string }

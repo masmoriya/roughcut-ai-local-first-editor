@@ -9,7 +9,7 @@
 // the Shorts screen, "running" comes from the mutation keys and the ticks,
 // progress line and outcome from shortsStore.
 
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useIsMutating } from "@tanstack/react-query";
 import { useStore } from "@tanstack/react-store";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -36,7 +36,6 @@ import {
 } from "../state/shortsStore";
 import { setScreen } from "../state/viewStore";
 import { errText, slugify } from "./clipUtil";
-import { PlayerDrawer } from "./PlayerDrawer";
 import { PreviewPanel } from "./PreviewPanel";
 import { SavedClipRow } from "./SavedClipRow";
 import { TaskLine } from "./TaskLine";
@@ -54,8 +53,6 @@ const EXPORT_RUN: RunOptions<ExportClipsArgs, ExportClipsResult> = {
       exported: { dir: a.out_dir, results: r.results, titles: s.exportJob?.titles ?? {} },
       exportJob: null,
     });
-    const first = r.results.find((x) => x.path)?.path;
-    if (first) void revealPath(first);
   },
   onError: (e, a) => patchShorts(a.project_id, { exportError: errText(e), exportJob: null }),
 };
@@ -68,9 +65,6 @@ export function ClipsScreen({ projectId }: { projectId: string }) {
   const { data: clips = [] } = useClips(projectId);
   useEditorKeyboard(project, transcript);
   const exportBatch = useExportClips(projectId, EXPORT_RUN);
-  // Running anywhere: a make from the Shorts screen lists its clips here
-  // before their crops are framed.
-  const making = useIsMutating({ mutationKey: clipRunKeys.make(projectId) }) > 0;
   const exporting = useIsMutating({ mutationKey: clipRunKeys.export(projectId) }) > 0;
 
   const s = useStore(shortsStore, (all) => all[projectId] ?? EMPTY_SHORTS);
@@ -78,8 +72,7 @@ export function ClipsScreen({ projectId }: { projectId: string }) {
   const toExport = clips.filter((c) => ticked.has(c.id));
 
   const runExport = async () => {
-    // While a make is framing, its clips are listed with crops not yet set.
-    if (toExport.length === 0 || exporting || making) return;
+    if (toExport.length === 0 || exporting) return;
     let dir: string;
     if (isTauri) {
       let chosenDir: string | string[] | null;
@@ -109,6 +102,8 @@ export function ClipsScreen({ projectId }: { projectId: string }) {
   };
 
   const exportedOk = s.exported?.results.filter((r) => r.path) ?? [];
+  const revealPathname = exportedOk[0]?.path;
+  const [revealError, setRevealError] = useState<{ path: string; message: string } | null>(null);
   const exportedFailed = s.exported?.results.filter((r) => !r.path) ?? [];
 
   return (
@@ -122,7 +117,6 @@ export function ClipsScreen({ projectId }: { projectId: string }) {
             ▶ plays a clip here · Space plays / pauses. "crop" frames a 9:16 clip over the picture: drag it, drag a
             corner to zoom in, or centre it on the speaker.
           </p>
-          <PlayerDrawer projectId={projectId} />
         </section>
 
         <section className="shorts-main">
@@ -132,21 +126,16 @@ export function ClipsScreen({ projectId }: { projectId: string }) {
             <button
               className="ghost-btn primary"
               onClick={() => void runExport()}
-              disabled={toExport.length === 0 || exporting || making}
-              title={
-                making
-                  ? "Wait for the shorts being made to be framed"
-                  : "Export the ticked clips as MP4s into one folder"
-              }
+              disabled={toExport.length === 0 || exporting}
+              title="Export the ticked clips as MP4s into one folder"
             >
               {exporting ? "exporting…" : `export ${toExport.length || ""}`.trim()}
             </button>
           </div>
 
-          {(making || exporting) && (
+          {exporting && (
             <div className="shorts-tasks">
-              {making && <TaskLine label="make" event={s.progress.make_clips ?? null} waiting="making the shorts…" />}
-              {exporting && <TaskLine label="export" event={s.progress.export_clips ?? null} waiting="starting…" />}
+              <TaskLine label="export" event={s.progress.export_clips ?? null} waiting="starting…" />
             </div>
           )}
 
@@ -156,12 +145,18 @@ export function ClipsScreen({ projectId }: { projectId: string }) {
             <div className="shorts-result">
               <span>
                 exported {exportedOk.length} of {s.exported.results.length} to {s.exported.dir}
-                {exportedOk[0]?.path && (
-                  <button className="reveal-btn" onClick={() => void revealPath(exportedOk[0]!.path!)}>
-                    reveal
+                {revealPathname && (
+                  <button className="reveal-btn" onClick={() => {
+                    setRevealError(null);
+                    void revealPath(revealPathname).catch((error) => {
+                      setRevealError({ path: revealPathname, message: errText(error) });
+                    });
+                  }}>
+                    Reveal
                   </button>
                 )}
               </span>
+              {revealError && revealError.path === revealPathname && <span role="alert">{revealError.message}</span>}
               {exportedOk.map((r) => (
                 <span key={r.clip_id} className="shorts-file">
                   {r.path!.split("/").pop()}
@@ -183,8 +178,6 @@ export function ClipsScreen({ projectId }: { projectId: string }) {
                 <button
                   className="link-btn"
                   onClick={() => setTicked(projectId, clips.map((c) => c.id))}
-                  disabled={making}
-                  title={making ? "Wait for the shorts being made to be framed" : undefined}
                 >
                   all
                 </button>
@@ -214,12 +207,7 @@ export function ClipsScreen({ projectId }: { projectId: string }) {
               <button className="link-btn" onClick={() => setScreen("editor")}>
                 editor
               </button>{" "}
-              (select transcript text → right-click → Add to clip, or the Clips tab's finder), or make shorts on
-              the{" "}
-              <button className="link-btn" onClick={() => setScreen("shorts")}>
-                Shorts
-              </button>{" "}
-              screen.
+              by selecting transcript text and choosing Add to clip.
             </p>
           )}
         </section>

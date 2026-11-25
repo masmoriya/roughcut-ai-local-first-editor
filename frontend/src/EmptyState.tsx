@@ -1,18 +1,14 @@
-// First-run flow: drop a video (or pick one), then
-// create_project { name, file_path } (probes and attaches the video in one
-// step) -> transcribe, with a progress bar. See ingest.ts.
+// First-run media import. See ingest.ts.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { listen } from "@tauri-apps/api/event";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
-import { downloadWhisperModel, getSetupStatus, isTauri, onAppEvent } from "./ipc/api";
+import { getSetupStatus, isTauri, type MediaSetupStatus } from "./ipc/api";
 import { ingestFile } from "./ingest";
 import { useProjects, useRestoreProject } from "./ipc/queries";
-import { useModelStatus } from "./state/modelStore";
-import { ModelChip } from "./panels/ModelChip";
-import type { WhisperTier, ProgressEvent, SetupStatus } from "./ipc/types";
 import { errText } from "./panels/clipUtil";
+import { OpenResolveReview } from "./panels/ResolveReview";
 
 /** The empty state is also where you land after trashing your LAST project —
  *  the trash must be reachable from here, not just the project switcher. */
@@ -23,7 +19,7 @@ function TrashList() {
   if (trash.length === 0) return null;
   return (
     <div className="empty-trash">
-      <span className="empty-trash-label">trash</span>
+      <span className="empty-trash-label">Trash · kept for 30 days</span>
       {trash.map((p) => (
         <button
           key={p.id}
@@ -41,89 +37,12 @@ function TrashList() {
 
 type Phase = "idle" | "working";
 
-/** First-run checklist: shown until ffmpeg is found and (when the native
- *  whisper engine is compiled in) a speech model is downloaded. */
-function SetupCard({ status, onChanged }: { status: SetupStatus; onChanged: () => void }) {
-  const [downloading, setDownloading] = useState<WhisperTier | null>(null);
-  const [progress, setProgress] = useState(0);
-  const [message, setMessage] = useState("");
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    return onAppEvent<ProgressEvent>("progress", (p) => {
-      if (p.task === "model_download") {
-        setProgress(p.fraction);
-        setMessage(p.message);
-      }
-    });
-  }, []);
-
-  const download = async (tier: WhisperTier) => {
-    setError(null);
-    setDownloading(tier);
-    setProgress(0);
-    try {
-      await downloadWhisperModel(tier);
-      onChanged();
-    } catch (err) {
-      setError(errText(err));
-    } finally {
-      setDownloading(null);
-    }
-  };
-
-  const hosted = useModelStatus()?.mode === "hosted";
-  const needsModel = status.whisper_native && !status.whisper_model;
-  const modelName = status.whisper_model?.split(/[\\/]/).pop();
-
+function SetupCard({ onChanged }: { onChanged: () => void }) {
   return (
     <div className="setup-card">
-      <h3>Set up AI</h3>
-      <p className="setup-note">
-        {hosted
-          ? "One-time setup. Video and transcription run on this machine; AI steps run on Claude (Hosted)."
-          : "One-time setup. Everything runs on this machine."}
-      </p>
-      <div className="setup-row">
-        <span className={`setup-dot${status.ffmpeg ? " ok" : ""}`} />
-        <div className="setup-row-body">
-          <strong>Video toolchain (ffmpeg)</strong>
-          {status.ffmpeg ? (
-            <span className="setup-detail">{status.ffmpeg_path}</span>
-          ) : (
-            <span className="setup-detail">
-              Not found — install with <code>brew install ffmpeg</code>, then{" "}
-              <button className="link-btn" onClick={onChanged}>re-check</button>
-            </span>
-          )}
-        </div>
-      </div>
-      <div className="setup-row">
-        <span className={`setup-dot${!needsModel ? " ok" : ""}`} />
-        <div className="setup-row-body">
-          <strong>Speech model (whisper)</strong>
-          {!needsModel ? (
-            <span className="setup-detail">{modelName ?? "ready"}</span>
-          ) : downloading ? (
-            <>
-              <div className="progress-track">
-                <div className="progress-fill" style={{ width: `${Math.round(progress * 100)}%` }} />
-              </div>
-              <span className="setup-detail">{message || "downloading…"}</span>
-            </>
-          ) : (
-            <span className="setup-actions">
-              <button className="primary-btn" onClick={() => void download("accurate")}>
-                Best quality · 550 MB
-              </button>
-              <button className="ghost-btn" onClick={() => void download("compact")}>
-                Smaller · 190 MB
-              </button>
-            </span>
-          )}
-        </div>
-      </div>
-      {error && <p className="empty-error">{error}</p>}
+      <h3>FFmpeg required</h3>
+      <p className="setup-note">Install FFmpeg to import video, then check again.</p>
+      <button className="link-btn" onClick={onChanged}>Check again</button>
     </div>
   );
 }
@@ -135,12 +54,10 @@ function baseName(path: string): string {
 
 export function EmptyState() {
   const [phase, setPhase] = useState<Phase>("idle");
-  const [progress, setProgress] = useState(0);
   const [message, setMessage] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
-  const [setup, setSetup] = useState<SetupStatus | null>(null);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [setup, setSetup] = useState<MediaSetupStatus | null>(null);
   const workingRef = useRef(false);
   const queryClient = useQueryClient();
 
@@ -149,24 +66,13 @@ export function EmptyState() {
   }, []);
   useEffect(refreshSetup, [refreshSetup]);
 
-  useEffect(() => {
-    return onAppEvent<ProgressEvent>("progress", (p) => {
-      if (p.task === "transcribe") {
-        setProgress(p.fraction);
-        setMessage(p.message);
-      }
-    });
-  }, []);
-
-  const setupIncomplete =
-    isTauri && !!setup && (!setup.ffmpeg || (setup.whisper_native && !setup.whisper_model));
+  const setupIncomplete = isTauri && !!setup && !setup.ffmpeg;
 
   const start = async (name: string, filePath: string) => {
     if (workingRef.current) return;
     workingRef.current = true;
     setError(null);
     setPhase("working");
-    setProgress(0);
     setMessage("Creating project…");
     try {
       await ingestFile(name, filePath, { onPhase: setMessage });
@@ -198,40 +104,25 @@ export function EmptyState() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const onBrowserDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    setDragOver(false);
-    if (isTauri) return; // handled by the native drag-drop event
-    const file = e.dataTransfer.files?.[0];
-    if (file) void start(baseName(file.name), file.name);
-  };
-
-  const onPick = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) void start(baseName(file.name), file.name);
-    e.target.value = "";
-  };
-
-  // In Tauri the HTML file input only exposes a bare file NAME; the native
-  // dialog returns the real absolute path the asset protocol can play.
   const choose = async () => {
-    if (!isTauri) {
-      fileInputRef.current?.click();
-      return;
+    setError(null);
+    try {
+      const path = await openFileDialog({
+        multiple: false,
+        directory: false,
+        filters: [{ name: "Video", extensions: ["mp4", "mov", "mkv", "avi", "m4v", "webm"] }],
+      });
+      if (typeof path === "string") await start(baseName(path), path);
+    } catch (error) {
+      setError(errText(error));
     }
-    const path = await openFileDialog({
-      multiple: false,
-      directory: false,
-      filters: [{ name: "Video", extensions: ["mp4", "mov", "mkv", "avi", "m4v", "webm"] }],
-    });
-    if (typeof path === "string") void start(baseName(path), path);
   };
 
   return (
     <div className="empty-state">
       {phase === "idle" ? (
         <>
-          {setupIncomplete && setup && <SetupCard status={setup} onChanged={refreshSetup} />}
+          {setupIncomplete && setup && <SetupCard onChanged={refreshSetup} />}
           <div
             className={`drop-zone${dragOver ? " over" : ""}`}
             onClick={() => void choose()}
@@ -240,7 +131,7 @@ export function EmptyState() {
               setDragOver(true);
             }}
             onDragLeave={() => setDragOver(false)}
-            onDrop={onBrowserDrop}
+            onDrop={(event) => { event.preventDefault(); setDragOver(false); }}
           >
             <svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.4">
               <rect x="2" y="4" width="20" height="16" rx="2.5" />
@@ -248,32 +139,14 @@ export function EmptyState() {
             </svg>
             <h2>Drop a video or click to choose</h2>
             <p>Your footage never leaves this machine.</p>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="video/*"
-              style={{ display: "none" }}
-              onChange={onPick}
-            />
           </div>
-          {!isTauri && (
-            <button
-              className="primary-btn"
-              onClick={() => void start("i-quit-rough-draft", "/demo/talking-head.mp4")}
-            >
-              Use demo footage
-            </button>
-          )}
-          {error && <p className="empty-error">{error}</p>}
-          <ModelChip variant="line" />
+          {isTauri && <OpenResolveReview />}
+          {error && <p className="empty-error" role="alert">{error}</p>}
           <TrashList />
         </>
       ) : (
         <div className="import-progress">
           <h2>Preparing your project</h2>
-          <div className="progress-track">
-            <div className="progress-fill" style={{ width: `${Math.round(progress * 100)}%` }} />
-          </div>
           <p className="progress-message">{message}</p>
         </div>
       )}

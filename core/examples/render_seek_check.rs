@@ -97,6 +97,7 @@ async fn main() {
     let out1 = dir.join("late.mp4");
     let t = Instant::now();
     let job = RenderJob {
+        audio_stream_index: None,
         media: &media, pieces: &late, out_path: &out1.to_string_lossy(), audio_offset_s: 0.0,
         screen: None, vertical_crop: None,
     };
@@ -130,6 +131,7 @@ async fn main() {
     let reversed = vec![vec![span(105.0, 125.0)], vec![span(30.0, 50.0)]];
     let out2 = dir.join("reversed.mp4");
     let job = RenderJob {
+        audio_stream_index: None,
         media: &media, pieces: &reversed, out_path: &out2.to_string_lossy(), audio_offset_s: 0.0,
         screen: None, vertical_crop: None,
     };
@@ -144,6 +146,7 @@ async fn main() {
     for (offset, crop, name) in [(0.4, None, "delay"), (-0.4, None, "advance"), (0.0, Some(0.5), "vertical")] {
         let out = dir.join(format!("{name}.mp4"));
         let job = RenderJob {
+            audio_stream_index: None,
             media: &media, pieces: &reversed, out_path: &out.to_string_lossy(), audio_offset_s: offset,
             screen: None, vertical_crop: crop.map(|x| roughcut_core::model::ClipFraming { crop_x: x, ..roughcut_core::model::ClipFraming::CENTRED }),
         };
@@ -176,6 +179,7 @@ async fn main() {
         let layout = roughcut_core::model::Layout { mode: mode.into(), ..Default::default() };
         let out = dir.join(format!("composite-{mode}.mp4"));
         let job = RenderJob {
+            audio_stream_index: None,
             media: &media, pieces: &reversed, out_path: &out.to_string_lossy(), audio_offset_s: 0.0,
             screen: Some((&screen, &layout)), vertical_crop: None,
         };
@@ -211,6 +215,7 @@ async fn main() {
     let exact = vec![vec![span(start, start + 10.0)], vec![span(120.0 + 7.0 * f, 125.0 + 7.0 * f)]];
     let out6 = dir.join("frame-exact.mp4");
     let job = RenderJob {
+        audio_stream_index: None,
         media: &media30, pieces: &exact, out_path: &out6.to_string_lossy(), audio_offset_s: 0.0,
         screen: None, vertical_crop: None,
     };
@@ -233,6 +238,7 @@ async fn main() {
     let tail = vec![vec![span(179.5, 185.0)]];
     let out7 = dir.join("screen-tail.mp4");
     let job = RenderJob {
+        audio_stream_index: None,
         media: &media, pieces: &tail, out_path: &out7.to_string_lossy(), audio_offset_s: 0.0,
         screen: Some((&screen, &layout)), vertical_crop: None,
     };

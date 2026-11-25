@@ -87,7 +87,7 @@ pub fn detect_fillers(transcript: &Transcript, custom_words: &[String]) -> Fille
         if seg.is_silence {
             continue;
         }
-        let words_norm: Vec<String> = seg.words.iter().map(|w| normalize_word(&w.text)).collect();
+        let words_norm: Vec<String> = seg.words.iter().map(|w| normalize_word(w.spoken_text())).collect();
         let all_filler = !words_norm.is_empty() && words_norm.iter().all(|w| stoplist.contains(w));
         if all_filler {
             findings.segment_ids.push(seg.id);
@@ -224,12 +224,12 @@ pub fn filler_spots(transcript: &Transcript, custom_words: &[String]) -> Vec<Fil
     stoplist.extend(custom_words.iter().map(|w| normalize_word(w)));
     let mut words: Vec<(f64, f64, bool)> = vec![];
     for seg in transcript.segments.iter().filter(|s| !s.is_silence) {
-        let flags: Vec<bool> = seg.words.iter().map(|w| stoplist.contains(&normalize_word(&w.text))).collect();
+        let flags: Vec<bool> = seg.words.iter().map(|w| stoplist.contains(&normalize_word(w.spoken_text()))).collect();
         if !flags.is_empty() && flags.iter().all(|&f| f) {
             continue; // a whole-filler segment
         }
         for (w, f) in seg.words.iter().zip(flags) {
-            if !normalize_word(&w.text).is_empty() {
+            if !normalize_word(w.spoken_text()).is_empty() {
                 words.push((w.start, w.end, f));
             }
         }
@@ -893,11 +893,13 @@ mod hybrid_tests {
             media_id: Uuid::new_v4(),
             language: "en".into(),
             segments: vec![TranscriptSegment {
+                original_text: None,
+                speaker: None,
                 id: Uuid::new_v4(),
                 start,
                 end,
                 text: "charm,".into(),
-                words: vec![crate::model::Word { text: "charm,".into(), start, end, confidence: 0.9 }],
+                words: vec![crate::model::Word { original_text: None, text: "charm,".into(), start, end, confidence: 0.9 }],
                 is_filler: false,
                 is_silence: false,
                 take_group_id: None,
@@ -906,6 +908,8 @@ mod hybrid_tests {
             model_used: "test".into(),
             words_trimmed: false,
             words_aligned: false,
+            source_fingerprint: None,
+            source_audio_stream_index: None,
         }
     }
 
@@ -931,8 +935,10 @@ mod hybrid_tests {
 
     #[test]
     fn filler_spots_know_their_neighbours_and_join_runs() {
-        let w = |t: &str, a: f64, b: f64| crate::model::Word { text: t.into(), start: a, end: b, confidence: 0.9 };
+        let w = |t: &str, a: f64, b: f64| crate::model::Word { original_text: None, text: t.into(), start: a, end: b, confidence: 0.9 };
         let seg = |words: Vec<crate::model::Word>| TranscriptSegment {
+            original_text: None,
+            speaker: None,
             id: Uuid::new_v4(),
             start: words[0].start,
             end: words.last().unwrap().end,
@@ -954,6 +960,8 @@ mod hybrid_tests {
             model_used: "test".into(),
             words_trimmed: false,
             words_aligned: false,
+            source_fingerprint: None,
+            source_audio_stream_index: None,
         };
         let spots = filler_spots(&t, &[]);
         assert_eq!(spots, vec![FillerSpot { start: 1.45, end: 1.8, prev_end: 1.4, next_start: 1.85 }]);
@@ -979,7 +987,7 @@ mod hybrid_tests {
         let mut peaks = vec![0u8; 1000];
         peaks[665..680].fill(10); // a soft fade-in from 13.3 s, below "loud"
         peaks[680..900].fill(48);
-        let w = |t: &str, a: f64, b: f64| crate::model::Word { text: t.into(), start: a, end: b, confidence: 0.9 };
+        let w = |t: &str, a: f64, b: f64| crate::model::Word { original_text: None, text: t.into(), start: a, end: b, confidence: 0.9 };
         let words = vec![w("Third", 0.0, 4.31), w("time", 4.31, 7.75), w("is", 7.75, 9.48), w("a", 9.49, 10.35), w("charm,", 13.56, 14.66)];
         let mut t = one_word_transcript(0.0, 23.4);
         t.segments[0].words = words;

@@ -1446,6 +1446,8 @@ mod tests {
 
     fn seg(start: f64, end: f64, text: &str) -> TranscriptSegment {
         TranscriptSegment {
+            original_text: None,
+            speaker: None,
             id: Uuid::new_v4(),
             start,
             end,
@@ -1496,7 +1498,7 @@ mod tests {
             ("them", 3.0, 3.2), (",", 3.2, 3.2), ("I", 3.3, 3.4), ("had", 3.4, 3.6), ("to", 3.6, 3.7),
             ("do", 3.7, 3.9), ("all", 3.9, 4.2), ("that", 4.2, 4.6), ("work", 4.6, 6.0),
         ];
-        a.words = tokens.iter().map(|(t, s, e)| Word { text: t.to_string(), start: *s, end: *e, confidence: 1.0 }).collect();
+        a.words = tokens.iter().map(|(t, s, e)| Word { original_text: None, text: t.to_string(), start: *s, end: *e, confidence: 1.0 }).collect();
         let s = sents_of(&[a, b]);
         let texts: Vec<&str> = s.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(
@@ -1520,7 +1522,7 @@ mod tests {
     }
 
     fn words(list: &[(&str, f64, f64)]) -> Vec<Word> {
-        list.iter().map(|(t, s, e)| Word { text: t.to_string(), start: *s, end: *e, confidence: 1.0 }).collect()
+        list.iter().map(|(t, s, e)| Word { original_text: None, text: t.to_string(), start: *s, end: *e, confidence: 1.0 }).collect()
     }
 
     #[test]

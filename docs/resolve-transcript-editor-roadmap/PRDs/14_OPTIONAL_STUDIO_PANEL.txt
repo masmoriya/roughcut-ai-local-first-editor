@@ -1,0 +1,38 @@
+PRD 14: OPTIONAL NATIVE DAVINCI RESOLVE STUDIO PANEL
+Priority: P2 only after G4, separate product decision
+
+GOAL
+Create a native embedded Workflow Integration for Resolve Studio that feels like Premiere/Descript editing inside Resolve, without losing the reliable standalone + XML fallback.
+
+CRITICAL RESTRICTION
+Workflow Integrations are available in Resolve Studio, not free. Do not remove the standalone/free-edition XML path when adding this. Confirm actual Resolve developer workflow host APIs and electron version before implementation.
+
+DEFINITION
+Optional integration panel launched via Workspace > Workflow Integrations with transcript, search, rules, proposed cut review, local Rust service handshake and 'Create New Edited Timeline' control.
+
+MVP FOR NATIVE PANEL
+SP-01 Show current Resolve project, selected source/track and edition/version.
+SP-02 Read transcript/edit-plan status from local app (read-only by default).
+SP-03 Click a word to seek Resolve preview where API allows, with tested timebase conversion.
+SP-04 Send selection/proposal commands to local app through authenticated local service.
+SP-05 Approve a batch and create a NEW edited timeline. Never silently mutate active complicated timeline.
+SP-06 Show explicit unsupported conditions: VFR, multicam, nested sequences, detached audio, source relink failures.
+SP-07 Support re-open after app/Resolve restart. Do not duplicate or lose project mapping.
+SP-08 Separate UI and runtime from privileged OS operations; Tauri app handles media and model work, panel only bridges.
+
+POSSIBLE LATER WORK
+Actual active timeline edits, multi-track linked cuts, media pool native transcription read/write where supported, speaker-aware edits, audio crossfades, subtitling and waveform markers.
+
+IMPLEMENTATION
+New: resolve-workflow-plugin/ for Studio workflow shell.
+Existing: core/src/resolve.rs and core/src/mcp/server.rs (secured), bridge manifest, frontend transcript components refactored for reuse only if practical.
+
+ACCEPTANCE
+SP-T1 Studio 21.x launches plugin inside Workflow Integrations.
+SP-T2 No dependency on untrusted UI to access arbitrary filesystem.
+SP-T3 Round-trip 30+ edits yields same frame plan as standalone export.
+SP-T4 Closing panel or losing server connection does not corrupt Resolve project.
+SP-T5 Free Resolve users see a supported alternative, not a broken installation.
+
+GO/NO-GO
+Do not start unless the standalone version is useful and actual users consistently request an embedded panel. This phase has substantial API and product complexity.

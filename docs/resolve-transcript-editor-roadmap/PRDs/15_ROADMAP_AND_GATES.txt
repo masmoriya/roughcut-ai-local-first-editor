@@ -1,0 +1,65 @@
+IMPLEMENTATION ROADMAP AND APPROVAL GATES
+Version: 1.0
+
+DEPENDENCY PATH
+G0 -> G1 -> G2 -> MVP engine/UI -> G3 -> G4 -> G5 -> release
+No parallel work may skip security and real Resolve capability proof.
+
+PHASE 0: FORK AND BASELINE
+Prerequisite: user authorizes fork creation.
+Scope: PRD 02 + 17.
+Outputs: fork, baseline SHA, license file, risk register, disabled untrusted AI config, no installed binary.
+Exit G0: upstream provenance known and fork exists, safe to inspect. Human approves proceeding to isolated build work.
+
+PHASE 1: SECURITY AND BUILD REPRODUCIBILITY
+Scope: PRD 03 + 04 + 11 hardening subset.
+Outputs: least-privilege CSP/file scope, secure localhost auth, verified executable downloads, removed consumer terminal, locked dependencies, tests and dependency report.
+Exit G1: targeted static issues addressed and verified in sandbox; no critical/high release-scope findings; human approves executing GUI test code.
+
+PHASE 2: REAL RESOLVE COMPATIBILITY SPIKE
+Scope: PRD 05 + minimal PRD 06.
+Outputs: documented Resolve edition/version matrix, working selected-source -> local edit -> exported XML -> NEW imported timeline, verified audio and frames.
+Exit G2: one actual Resolve import end-to-end test on disposable project succeeds. Otherwise STOP and repair handoff before building UI.
+
+PHASE 3: TRANSCRIPT AND RULES MVP
+Scope: PRD 07 + 08 + 09.
+Outputs: local word transcript, seeks, manual corrections, search, filler/profanity/custom word rules, keep/protect exceptions, preview and batch selection.
+Exit G3: complete offline path; per-rule selected/kept cases pass; restart/undo works; user can perform it without CLI.
+
+PHASE 4: FRAME-EXACT EDIT PLAN AND RESOLVE BRIDGE
+Scope: PRD 06 + 10 + 12.
+Outputs: reliable state model, deterministic cuts, new-timeline import, media mapping, duplicate-safe export, 50-cut sync test, real Resolve tests.
+Exit G4: all target P0 fixture/matrix tests pass; no data loss and original media hashes unchanged. Beta sign-off.
+
+PHASE 5: PACKAGING, LICENSE AND EARLY BETA
+Scope: PRD 13 + 17 + 19.
+Outputs: signed/notarized candidate, install/uninstall, privacy/consent, attribution, release notes, tester setup, regression evidence.
+Exit G5: release checklist complete and human authorizes publication/installation. No automatic releases.
+
+PHASE 6 OPTIONAL: STUDIO NATIVE PANEL
+Scope: PRD 14.
+Exit: only after MVP beta validates demand. Free edition remains supported through documented fallback where actually tested.
+
+PRIORITY ORDER FOR CODING ASSISTANT
+First: security boundaries, repo provenance, minimal core changes.
+Second: prove actual XML import, not visual redesign.
+Third: word alignment, deterministic rules, one atomic edit plan.
+Fourth: transcript UI and user review affordances.
+Fifth: packaging, marketing, broad platform support.
+
+DEFINITION OF READY FOR ANY PR
+Prerequisites passed; code paths identified; user action/approval understood; fixtures exist; no unsupported Resolve assumption.
+
+DEFINITION OF DONE FOR ANY PR
+Small reviewable diff; unit tests; integration evidence where relevant; security impacts; rollback; updated doc and cross-platform caveats; no live file changes; human approved any privileged action.
+
+PR SIZE GUIDANCE
+Prefer one PR for one change: 'make CSP specific', 'make token file 0600', 'add selected clip enforcement', 'add word-search normalization'. Do not combine a security overhaul, new design system and transcription rewrite in one PR.
+
+STOP SIGNALS
+Failed or unsupported Resolve timeline import.
+Unpinned binary execution path.
+Evidence of unexpected media exfiltration.
+License incompatibility for intended distribution.
+Cut frame drift or loss of A/V sync.
+Any automation attempting an unapproved release/install/deployment.

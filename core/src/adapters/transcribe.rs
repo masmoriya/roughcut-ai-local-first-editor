@@ -10,12 +10,15 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::process::Command;
 use uuid::Uuid;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 /// Model files we know how to use, best first. The first one present in
 /// `<data dir>/models/` wins; `WHISPER_MODEL` overrides everything.
 pub const MODEL_CANDIDATES: &[&str] = &[
     "ggml-large-v3-turbo-q5_0.bin",
     "ggml-small-q5_1.bin",
+    "ggml-small.bin",
+    "ggml-small.en.bin",
     "ggml-base.bin",
 ];
 
@@ -34,13 +37,24 @@ pub fn resolve_whisper_model() -> Option<PathBuf> {
     MODEL_CANDIDATES.iter().map(|f| models_dir().join(f)).find(|p| p.is_file())
 }
 
-fn require_model() -> Result<PathBuf> {
-    resolve_whisper_model().ok_or_else(|| {
+async fn require_model() -> Result<PathBuf> {
+    let path = resolve_whisper_model().ok_or_else(|| {
         CoreError::Unavailable(format!(
             "no whisper model found in {} — download one from the setup screen or set WHISPER_MODEL",
             models_dir().display()
         ))
-    })
+    })?;
+    let expected = match path.file_name().and_then(|name| name.to_str()) {
+        Some("ggml-small.bin") => Some("1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b"),
+        Some("ggml-small.en.bin") => Some("c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d"),
+        Some("ggml-base.bin") => Some("60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe"),
+        Some(name) => crate::setup::MODEL_TIERS.iter().find(|tier| tier.file == name).map(|tier| tier.sha256),
+        None => None,
+    }.ok_or_else(|| CoreError::Unavailable("Use a verified Whisper model from Setup".into()))?;
+    let candidate = path.clone();
+    tokio::task::spawn_blocking(move || crate::download::verify_file(&candidate, expected))
+        .await.map_err(|error| CoreError::Other(format!("Model verification failed: {error}")))??;
+    Ok(path)
 }
 
 /// True when the in-process whisper.cpp engine is compiled in.
@@ -59,7 +73,20 @@ pub trait Transcriber: Send + Sync {
         language: &str,
         project_id: Option<uuid::Uuid>,
         sink: &SharedSink,
+        cancel: Arc<AtomicBool>,
     ) -> Result<Transcript>;
+}
+
+pub struct ImportOnlyTranscriber;
+
+#[async_trait]
+impl Transcriber for ImportOnlyTranscriber {
+    async fn transcribe(
+        &self, _media: &Media, _wav_path: &str, _language: &str,
+        _project_id: Option<uuid::Uuid>, _sink: &SharedSink, _cancel: Arc<AtomicBool>,
+    ) -> Result<Transcript> {
+        Err(CoreError::Unavailable("Import a timed JSON or SRT transcript to edit this source.".into()))
+    }
 }
 
 pub fn whisper_available() -> bool {
@@ -85,19 +112,28 @@ impl Transcriber for WhisperCli {
         language: &str,
         _project_id: Option<uuid::Uuid>,
         _sink: &SharedSink,
+        cancel: Arc<AtomicBool>,
     ) -> Result<Transcript> {
-        let model = require_model()?.to_string_lossy().into_owned();
+        let model = require_model().await?.to_string_lossy().into_owned();
         let out_base = format!("{wav_path}.transcript");
         let mut cmd = Command::new("whisper-cli");
         cmd.args(["-m", &model, "-f", wav_path, "-ojf", "-of", &out_base]);
         if language != "auto" && !language.is_empty() {
             cmd.args(["-l", language]);
         }
-        let out = cmd
+        let output = cmd
+            .kill_on_drop(true)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
-            .await
+            .output();
+        let out = tokio::select! {
+            result = output => result,
+            _ = async {
+                while !cancel.load(Ordering::Relaxed) {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            } => return Err(CoreError::Unavailable("Transcription cancelled".into())),
+        }
             .map_err(|e| CoreError::Unavailable(format!("whisper-cli: {e}")))?;
         if !out.status.success() {
             return Err(CoreError::Other(format!(
@@ -127,6 +163,7 @@ fn parse_whisper_json(json: &str, media_id: Uuid) -> Result<Transcript> {
                 continue; // special tokens
             }
             words.push(Word {
+                original_text: None,
                 text: t.trim().to_string(),
                 start: tok["offsets"]["from"].as_f64().unwrap_or(0.0) / 1000.0,
                 end: tok["offsets"]["to"].as_f64().unwrap_or(0.0) / 1000.0,
@@ -137,6 +174,8 @@ fn parse_whisper_json(json: &str, media_id: Uuid) -> Result<Transcript> {
             continue;
         }
         segments.push(TranscriptSegment {
+            original_text: None,
+            speaker: None,
             id: Uuid::new_v4(),
             start,
             end,
@@ -148,7 +187,7 @@ fn parse_whisper_json(json: &str, media_id: Uuid) -> Result<Transcript> {
             is_best_take: false,
         });
     }
-    Ok(Transcript { id: Uuid::new_v4(), media_id, language, segments, model_used, words_trimmed: false, words_aligned: false })
+    Ok(Transcript { id: Uuid::new_v4(), media_id, language, segments, model_used, source_fingerprint: None, source_audio_stream_index: None, words_trimmed: false, words_aligned: false })
 }
 
 /// whisper.cpp's alignment-heads preset for a model file, by name: DTW word
@@ -230,7 +269,7 @@ pub fn tokens_to_words(tokens: &[RawToken], seg_start: f64, seg_end: f64) -> Vec
     let mut prev = lo;
     for b in &built {
         let start = b.start.clamp(prev, hi);
-        words.push(Word { text: b.text.clone(), start, end: start, confidence: b.p_sum / b.n as f64 });
+        words.push(Word { original_text: None, text: b.text.clone(), start, end: start, confidence: b.p_sum / b.n as f64 });
         prev = start;
     }
     for i in 0..words.len() {
@@ -257,8 +296,9 @@ impl Transcriber for WhisperRs {
         language: &str,
         project_id: Option<uuid::Uuid>,
         sink: &SharedSink,
+        cancel: Arc<AtomicBool>,
     ) -> Result<Transcript> {
-        let model = require_model()?;
+        let model = require_model().await?;
         let samples = read_wav_mono_f32(wav_path)?;
         let media_id = media.id;
         let lang = language.to_string();
@@ -289,6 +329,16 @@ impl Transcriber for WhisperRs {
                 .map_err(|e| CoreError::Other(format!("whisper state: {e}")))?;
 
             let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+            unsafe extern "C" fn should_abort(data: *mut std::ffi::c_void) -> bool {
+                // The owning Arc stays alive through the synchronous full() call.
+                unsafe { (&*data.cast::<AtomicBool>()).load(Ordering::Relaxed) }
+            }
+            // whisper-rs 0.16 boxes a trait object but casts it back to the
+            // concrete closure type. Pass the atomic directly instead.
+            unsafe {
+                params.set_abort_callback(Some(should_abort));
+                params.set_abort_callback_user_data(Arc::as_ptr(&cancel).cast_mut().cast());
+            }
             if !lang.is_empty() {
                 params.set_language(Some(&lang)); // "auto" triggers detection
             }
@@ -312,15 +362,17 @@ impl Transcriber for WhisperRs {
                         crate::events::CoreEvent::progress(crate::events::ProgressTask::Transcribe,
                             project_id,
                             frac,
-                            format!("transcribing on-device — {}%", pct.clamp(0, 100)),
+                            format!("Transcribing on device · {}%", pct.clamp(0, 100)),
                         ),
                     );
                 });
             }
 
-            state
-                .full(params, &samples)
-                .map_err(|e| CoreError::Other(format!("whisper transcribe: {e}")))?;
+            let result = state.full(params, &samples);
+            if cancel.load(Ordering::Relaxed) {
+                return Err(CoreError::Unavailable("Transcription cancelled".into()));
+            }
+            result.map_err(|e| CoreError::Other(format!("whisper transcribe: {e}")))?;
 
             let mut segments = vec![];
             for seg in state.as_iter() {
@@ -344,6 +396,8 @@ impl Transcriber for WhisperRs {
                 }
                 let words = tokens_to_words(&tokens, seg_start, seg_end);
                 segments.push(TranscriptSegment {
+                    original_text: None,
+                    speaker: None,
                     id: Uuid::new_v4(),
                     start: seg_start,
                     end: seg_end,
@@ -367,6 +421,8 @@ impl Transcriber for WhisperRs {
                 model_used: model_name,
                 words_trimmed: false,
                 words_aligned: false,
+                source_fingerprint: None,
+                source_audio_stream_index: None,
             })
         })
         .await
@@ -414,6 +470,7 @@ impl Transcriber for MockTranscriber {
         _language: &str,
         project_id: Option<uuid::Uuid>,
         sink: &SharedSink,
+        _cancel: Arc<AtomicBool>,
     ) -> Result<Transcript> {
         for i in 1..=4 {
             crate::events::send(
@@ -440,19 +497,16 @@ impl Transcriber for AutoTranscriber {
         language: &str,
         project_id: Option<uuid::Uuid>,
         sink: &SharedSink,
+        cancel: Arc<AtomicBool>,
     ) -> Result<Transcript> {
-        let caps = crate::capabilities::probe();
-        if caps.demo() {
-            return MockTranscriber.transcribe(media, wav_path, language, project_id, sink).await;
-        }
         #[cfg(feature = "whisper-native")]
         {
-            return WhisperRs.transcribe(media, wav_path, language, project_id, sink).await;
+            return WhisperRs.transcribe(media, wav_path, language, project_id, sink, cancel).await;
         }
         #[cfg(not(feature = "whisper-native"))]
         {
-            if caps.whisper_cli {
-                WhisperCli.transcribe(media, wav_path, language, project_id, sink).await
+            if crate::capabilities::probe().whisper_cli {
+                WhisperCli.transcribe(media, wav_path, language, project_id, sink, cancel).await
             } else {
                 Err(CoreError::Unavailable(
                     "no transcription engine: install whisper-cpp (whisper-cli) or build with the whisper-native feature"

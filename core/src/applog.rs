@@ -85,8 +85,6 @@ pub enum Event {
         #[serde(skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
         ms: u64,
-        #[serde(skip_serializing_if = "Tail::is_empty")]
-        stderr_tail: Tail,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<ErrText>,
     },
@@ -214,9 +212,6 @@ impl Tail {
     pub fn new(stderr: &str) -> Self {
         Tail(scrub_tail(stderr))
     }
-    fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
 }
 
 #[derive(Serialize)]
@@ -290,7 +285,15 @@ struct LogFile {
 impl LogFile {
     fn open(dir: &Path, max: u64) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
-        let file = OpenOptions::new().create(true).append(true).open(dir.join(FILE_NAME))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if !dir.symlink_metadata()?.is_dir() {
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Invalid log directory"));
+            }
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let file = open_private_log(&dir.join(FILE_NAME))?;
         let size = file.metadata()?.len();
         Ok(Self { dir: dir.to_path_buf(), file: Some(file), size, max })
     }
@@ -331,10 +334,30 @@ impl LogFile {
             std::fs::rename(&one, &two)?;
         }
         std::fs::rename(self.path(), &one)?;
-        self.file = Some(OpenOptions::new().create(true).append(true).open(self.path())?);
+        self.file = Some(open_private_log(&self.path())?);
         self.size = 0;
         Ok(())
     }
+}
+
+fn open_private_log(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+        if path.symlink_metadata().is_ok_and(|metadata| !metadata.is_file()) {
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Invalid log file"));
+        }
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
 }
 
 /// The `app_start` line: version, platform and the model settings.

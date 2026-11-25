@@ -1,0 +1,65 @@
+IMPLEMENTATION BACKLOG: ONE SMALL CHANGE PER TASK
+Baseline: RoughCut upstream commit 224753a7a9c2a8d998248bff1046e9d56604071d
+Status: all tasks NOT STARTED. Nothing in this PRD folder has been implemented.
+
+FORMAT
+ID | Priority | Depends on | Work in paths | Evidence to close
+
+G0: BASELINE
+F01 | P0 | none | Fork via GitHub UI with approval, pin exact upstream SHA. | Fork URL + verified base commit.
+F02 | P0 | F01 | docs/resolve-transcript-editor/security/BASELINE.txt. | Record original config, license, suspicious surfaces, unverified claims.
+F03 | P0 | F01 | .claude/settings.json; .mcp.json; .claude/skills/. | No auto-loaded external agents or MCP from checkout; review recorded.
+F04 | P0 | F01 | LICENSE, legal docs. | GPL distribution strategy and third-party notices documented.
+
+G1: SECURITY AND BUILD
+S01 | P0 | F02 | app/src-tauri/tauri.conf.json. | Explicit CSP; tested app scripts/media still function.
+S02 | P0 | S01 | app/src-tauri/capabilities/default.json; src/media.rs. | Imported media allowlist and path traversal/symlink tests pass.
+S03 | P0 | F02 | core/src/llm_runtime.rs; src/download.rs. | Pinned executable hash; corrupt archive never executes.
+S04 | P0 | F02 | core/src/mcp/server.rs. | 0600 token; opt-in; origin/host/auth tests.
+S05 | P0 | S04 | core/src/tools.rs; engine/confirm.rs; engine/mod.rs. | External apply/export/delete cannot bypass confirmation.
+S06 | P0 | F03 | core/src/pty.rs; frontend/TerminalPanel.tsx; app/src-tauri/src/lib.rs. | Consumer build lacks enabled shell.
+S07 | P0 | F02 | resolve-plugin/*.py. | Refuse endpoint URLs not matching approved loopback service.
+S08 | P0 | F02 | core/src/agent.rs. | Transcript injection harness; instructions stay data.
+B01 | P0 | F02 | Cargo.lock, frontend/package-lock.json, CI. | Locked dependency inventories and scans documented.
+B02 | P0 | B01,S01-S08 | .github/workflows/ci.yml. | Tests pass inside approved isolated machine; results recorded.
+B03 | P0 | B02 | docs/resolve-transcript-editor/security/BUILD_PROVENANCE.txt. | Reproducible build config, SBOM, artifact checksums.
+
+G2: RESOLVE FEASIBILITY
+R01 | P0 | B02 | tests/resolve_integration/. | Resolve Free/Studio edition/version probes with disposable media.
+R02 | P0 | R01 | resolve-plugin/RoughCut AI Draft.py. | Selection is explicit, no first-item fallback.
+R03 | P0 | R01 | core/src/export/xmeml.rs. | Audio/video and frame math correct in sample XML.
+R04 | P0 | R02,R03 | resolve-plugin/RoughCut Import Cut.py. | Generate and import NEW editable timeline; evidence capture.
+R05 | P0 | R04 | tests/resolve_integration/. | Reimport preserves original timeline and avoids wrong source selection.
+R06 | P0 | R04 | docs/resolve-transcript-editor/evidence/RESOLVE_MATRIX.txt. | Edition/version capability matrix with tested support and caveats.
+
+G3: TRANSCRIPT EDITOR
+T01 | P0 | R04 | core/src/model.rs; adapters/transcribe.rs; time.rs. | Stable word IDs, frame timebase and model provenance.
+T02 | P0 | T01 | core/src/store.rs. | Persistent transcript corrections/cache; crash recovery.
+T03 | P0 | T01 | frontend/TranscriptPanel.tsx. | Click word seeks correctly; text correction never cuts media.
+T04 | P0 | T03 | frontend/TranscriptPanel.tsx; viewStore.ts. | Select word range, mark protect/highlight/cut intent.
+T05 | P0 | T01 | core/src/rules.rs (new); detect.rs. | Exact/phrase/Unicode match unit tests.
+T06 | P0 | T05 | core/src/rules.rs; frontend/RulesPanel.tsx (new). | Select all, keep exceptions, saved rule sets persist.
+T07 | P0 | T04,T06 | frontend/CutReview.tsx. | Context and frame/duration diff shown before apply.
+T08 | P1 | T03 | frontend/TranscriptPanel.tsx. | Long transcript virtualization/keyboard accessibility tested.
+
+G4: EDIT PLAN AND PROVEN RESOLVE HANDOFF
+E01 | P0 | T07 | core/src/edit_plan.rs (new); engine/edits.rs. | Normalize range, protect word, merge intervals unit tests.
+E02 | P0 | E01 | core/src/engine/edits.rs; store.rs. | One atomic undoable batch across restart.
+E03 | P0 | E01,R03 | core/src/export/xmeml.rs; time.rs. | 24/25/29.97/30 fps 50-cut XML fixture tests.
+E04 | P0 | E03 | resolve-plugin/*.py; bridge manifest. | Explicit project selection, idempotency, source fingerprints.
+E05 | P0 | E02,E04 | tests/resolve_integration/. | 50+ cuts A/V synced; original source hash unchanged.
+E06 | P0 | E05 | docs/resolve-transcript-editor/evidence/. | G4 report with screenshots/logs from real Resolve.
+
+G5: RELEASE
+P01 | P1 | E06 | core/src/resolve.rs; resolve-plugin/install.sh. | Reversible per-user script install/uninstall.
+P02 | P1 | P01 | scripts/build-macos-app.sh; release.yml. | Signed/notarized build from pinned SHA.
+P03 | P1 | P02 | privacy/install/third-party notice docs. | No hidden model/telemetry/network behavior.
+P04 | P1 | P02,P03 | docs/resolve-transcript-editor/RELEASE_MANIFEST.txt. | Artifact hashes, SBOM, test report, human release approval.
+
+P2 OPTIONAL
+X01 | P2 | G5 + user demand | resolve-workflow-plugin/ (new). | Studio plugin can open and show transcript safely.
+X02 | P2 | X01 | core/src/resolve.rs; bridge layer. | Roundtrip actions in Studio-only panel match standalone engine.
+X03 | P2 | X02 | tests/resolve_integration/. | Robust multi-track active timeline handling, if feasible.
+
+EXECUTION POLICY
+Before beginning each ID, verify gates/dependencies and tell user the exact changes/tests. After implementing, mark PASS only with evidence. On blocker, stop that branch and provide explicit next action. Never publish or install without human approval.

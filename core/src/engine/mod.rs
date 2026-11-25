@@ -19,7 +19,11 @@ mod clips;
 mod confirm;
 mod edits;
 mod proposals;
+mod protected_ranges;
 mod media;
+mod multicam;
+mod external_transcript;
+pub(crate) use external_transcript::{parse_external_transcript, parse_srt_transcript};
 mod projects;
 pub mod route;
 mod semantic;
@@ -29,7 +33,7 @@ pub use clips::{ClipChanges, ClipScan, ClipSource, FaceCrop};
 pub use proposals::{fmt_seconds, AppliedProposal, ProposeOutcome, RoughCutReport};
 
 use crate::adapters::{
-    AutoTranscriber, AutoVideoEngine, Embedder, MockTranscriber,
+    Embedder, FfmpegCli, ImportOnlyTranscriber, MockTranscriber,
     MockVideoEngine, OllamaEmbedder, Transcriber, VideoEngine,
 };
 use crate::error::{CoreError, Result};
@@ -51,7 +55,7 @@ pub struct JournalEntry {
     pub redo: EditOp,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ProjectState {
     pub project: Option<Project>,
     pub transcript: Option<Transcript>,
@@ -62,6 +66,7 @@ pub struct ProjectState {
 pub struct EditOutcome {
     pub action: EditAction,
     pub timeline: Timeline,
+    pub removed_duration: f64,
     /// For [`EditOp::SplitClip`]: the two resulting clips.
     pub split_clips: Vec<Clip>,
 }
@@ -72,6 +77,7 @@ pub struct Inner {
     pub transcriber: Box<dyn Transcriber>,
     pub sink: SharedSink,
     pub demo: bool,
+    inference_enabled: std::sync::atomic::AtomicBool,
     /// Test override; production builds the Ollama embedder from preferences.
     embedder_override: Mutex<Option<Arc<dyn Embedder>>>,
     /// Pending user confirmations for externally-driven destructive ops.
@@ -84,6 +90,8 @@ pub struct Inner {
     pub(crate) rough_cut_peaks: Mutex<Option<Vec<u8>>>,
     /// Projects with a `find_clips` run in flight (one at a time each).
     scans: Mutex<HashSet<Uuid>>,
+    transcriptions: Mutex<HashMap<Uuid, Arc<std::sync::atomic::AtomicBool>>>,
+    proposal_writes: Mutex<()>,
     /// The LOCAL / HOSTED switch's key and status (see [`route`]).
     pub(crate) route: route::RouteState,
     /// Serialises every preferences load-modify-save, so a slow tool call
@@ -112,11 +120,14 @@ impl Editor {
                 transcriber,
                 sink,
                 demo,
+                inference_enabled: std::sync::atomic::AtomicBool::new(true),
                 embedder_override: Mutex::new(None),
                 confirms: Mutex::new(HashMap::new()),
                 require_confirm: std::sync::atomic::AtomicBool::new(false),
                 rough_cut_peaks: Mutex::new(None),
                 scans: Mutex::new(HashSet::new()),
+                transcriptions: Mutex::new(HashMap::new()),
+                proposal_writes: Mutex::new(()),
                 route: route::RouteState::new(Arc::new(crate::secrets::KeyringStore::hosted())),
                 prefs_write: Mutex::new(()),
                 state: Mutex::new(HashMap::new()),
@@ -124,31 +135,33 @@ impl Editor {
         }
     }
 
-    /// Production wiring: SQLite at the default path, real adapters when the
-    /// toolchain exists, fixture adapters otherwise (demo mode).
+    /// Production wiring: a private local SQLite library and real media adapters.
     pub fn bootstrap(sink: SharedSink) -> Result<Self> {
-        let store = SqliteStore::open(&SqliteStore::default_path())?;
-        Self::bootstrap_with_store(Box::new(store), sink)
+        let store = SqliteStore::open_local_library()?;
+        let editor = Self::bootstrap_with_store(Box::new(store), sink)?;
+        // Keys the removed "frontier" path left in plain text.
+        crate::secrets::remove_legacy_plaintext();
+        Ok(editor)
     }
 
     pub fn bootstrap_with_store(store: Box<dyn Store>, sink: SharedSink) -> Result<Self> {
-        // Auto adapters resolve real-vs-fixture PER CALL via capabilities::probe(),
-        // so installing ffmpeg or downloading a model mid-session just works.
+        // The production adapters resolve local dependencies at call time.
         let editor = Self::new(
             store,
-            Box::new(AutoVideoEngine),
-            Box::new(AutoTranscriber),
+            Box::new(FfmpegCli),
+            if crate::adapters::transcribe::whisper_native_enabled() {
+                Box::new(crate::adapters::transcribe::AutoTranscriber)
+            } else {
+                Box::new(ImportOnlyTranscriber)
+            },
             sink,
             false,
         );
         // The app shell has a UI that can answer confirmation prompts.
-        // ROUGHCUT_NO_CONFIRM=1 bypasses them (scripted/CI runs).
-        let confirm = std::env::var("ROUGHCUT_NO_CONFIRM").map(|v| v != "1").unwrap_or(true);
-        editor.inner.require_confirm.store(confirm, std::sync::atomic::Ordering::Relaxed);
+        editor.inner.require_confirm.store(true, std::sync::atomic::Ordering::Relaxed);
+        editor.inner.inference_enabled.store(false, std::sync::atomic::Ordering::Relaxed);
         // Trash older than 30 days is gone for good.
         let _ = editor.purge_trash(30);
-        // Keys the removed "frontier" path left in plain text.
-        crate::secrets::remove_legacy_plaintext();
         Ok(editor)
     }
 
@@ -171,10 +184,9 @@ impl Editor {
         editor
     }
 
-    /// Dynamic: fixtures forced (tests / FABLE_DEMO) or the media toolchain is
-    /// missing right now.
+    /// Whether this editor was explicitly created with fixture adapters.
     pub fn demo_mode(&self) -> bool {
-        self.inner.demo || crate::capabilities::probe().demo()
+        self.inner.demo
     }
 
     pub fn sink(&self) -> SharedSink {
@@ -189,8 +201,15 @@ impl Editor {
         self.inner.video.as_ref()
     }
 
+    pub fn inference_enabled(&self) -> bool {
+        self.inner.inference_enabled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Local embedder from preferences (same endpoint as the chat model).
     pub fn embedder(&self) -> Result<Arc<dyn Embedder>> {
+        if !self.inference_enabled() {
+            return Err(CoreError::Unavailable("Embedding is disabled in the desktop editor".into()));
+        }
         if let Some(e) = self.inner.embedder_override.lock().unwrap().clone() {
             return Ok(e);
         }

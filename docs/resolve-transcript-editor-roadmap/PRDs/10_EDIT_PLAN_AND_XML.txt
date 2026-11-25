@@ -1,0 +1,62 @@
+PRD 10: NON-DESTRUCTIVE EDIT PLAN, CUT PREVIEW AND RESOLVE XML
+Priority: P0 / quality gate
+
+GOAL
+Maintain one frame-exact truth for source media, transcript, selected cuts, playback and exported Resolve timeline. Never mutate original source media or an existing Resolve timeline as a side effect.
+
+CORE INVARIANTS
+1. SOURCE is immutable. Cuts operate on included ranges of the original source.
+2. Source frames and project timebase are canonical; seconds are only for UI/API transport.
+3. A planned cut is not an applied cut. There must be an explicit Apply state transition.
+4. The exact same edit plan drives preview, export, undo and audit log.
+5. Every apply creates one atomic journal entry. Undo restores exact previous ranges across restart.
+6. Export creates a new timeline representation; it never rewrites a .mov/.mp4 source.
+7. Resolve XML uses original media references, correct frame rates and audio links.
+
+REQUIRED PIPELINE
+A. Input selected source media and immutable transcript version.
+B. Normalize match/proposal ranges to source-frame intervals.
+C. Apply configurable pre/post padding and frame snapping.
+D. Merge overlapping intervals in a stable order; protect keep intervals; clamp to media bounds.
+E. Compute kept complementary intervals. Verify min clip length and avoid cuts inside protected words.
+F. Preview the expected keep list using current playback engine; identify abrupt cut joins; do not pretend to perform unseen audio repair.
+G. Show dry-run diff: N cuts, total removed frames, time before/after, each source interval.
+H. Commit approved edit plan atomically with edit journal.
+I. Export sanitized FCP7 xmeml (or supported Resolve format) from source ranges with linked audio and stable IDs.
+J. Resolve script imports a NEW timeline and verifies it exists.
+
+V1 SCOPE
+One source clip containing video + embedded audio; cuts are ripple edits within generated output; no multitrack effects preservation. For separate/synced audio, VFR, multicam, grade, nested timelines: return explicitly unsupported or enter read-only preview. Do not silently flatten a complicated source timeline.
+
+BUGS TO AVOID
+- Two consecutive cut proposals resolving to overlapping or reversed frame ranges.
+- Source timecode treated as timeline timecode.
+- 29.97 (30000/1001) treated as integer 30 and drifting over long sessions.
+- Unmatched audio track retaining deleted speech.
+- Consecutive edits replaying stale transcript IDs after retranscription.
+- Re-export modifying the live timeline under a duplicate name.
+- Imported XML linking to a temporary transcoded preview instead of the original source.
+- Save/undo losing state after process crash.
+
+IMPLEMENTATION PATHS
+core/src/time.rs
+core/src/model.rs
+core/src/engine/edits.rs
+core/src/engine/proposals.rs
+core/src/engine/clips.rs
+core/src/export/xmeml.rs
+core/src/export/mod.rs
+core/src/store.rs
+frontend/src/playback/engine.ts
+frontend/src/timeline/Timeline.tsx
+resolve-plugin/RoughCut Import Cut.py
+New: core/src/edit_plan.rs
+
+ACCEPTANCE
+E-T1 100 random valid cut sets produce no negative, overlapping, out-of-bounds or zero-length kept spans.
+E-T2 Sum kept_frames + removed_frames = source_frames (within intentionally accounted padding/edge rules).
+E-T3 Generated XML sample at each supported frame rate imports with <=1 frame discrepancy at every join.
+E-T4 A/V samples stay aligned across 50+ cuts.
+E-T5 A user can undo a whole bulk edit in one step after app restart.
+E-T6 Original media file SHA-256 unchanged after edit/export/import.
+E-T7 Re-import never changes the existing Resolve timeline; only a new one is created.

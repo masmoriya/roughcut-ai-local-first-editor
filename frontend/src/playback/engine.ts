@@ -47,13 +47,23 @@ export function usePlaybackEngine({ videoRef, src, ranges, duration }: PlaybackE
     return gaps.length ? [...cuts, ...gaps].sort((a, b) => a.start - b.start) : cuts;
   };
 
+  const stopAtSourceEnd = (video: HTMLVideoElement, target: number) => {
+    const end = durationRef.current;
+    if (end <= 0 || target < end) return false;
+    video.pause();
+    video.volume = 1;
+    setPlayhead(end);
+    setPlaying(false);
+    return true;
+  };
+
   // --- seek-follow: the <video> element follows seek requests -------------
   const seekNonce = useStore(viewStore, (s) => s.seekNonce);
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
     const t = viewStore.state.playhead;
-    if (Math.abs(v.currentTime - t) > 0.05) v.currentTime = t;
+    if (Math.abs(v.currentTime - t) > 0.001) v.currentTime = t;
     v.volume = 1; // a manual seek always lands at full volume
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [seekNonce]);
@@ -90,37 +100,25 @@ export function usePlaybackEngine({ videoRef, src, ranges, duration }: PlaybackE
   const rate = useStore(viewStore, (s) => s.playbackRate);
   useEffect(() => {
     const v = videoRef.current;
-    if (!v) return;
+    if (!v || !src) {
+      if (playing) setPlaying(false);
+      return;
+    }
     v.playbackRate = rate;
-    if (playing) void v.play().catch(() => setPlaying(false));
-    else v.pause();
+    if (!playing) {
+      v.pause();
+      return;
+    }
+    const jump = skipTarget(v.currentTime, skipRanges());
+    if (jump !== null) {
+      if (stopAtSourceEnd(v, jump)) return;
+      v.currentTime = jump;
+      setPlayhead(jump);
+    }
+    if (v.paused) v.volume = 1;
+    void v.play().catch(() => setPlaying(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [playing, rate, src]);
-
-  // --- mock-mode rAF clock (no playable video) -----------------------------
-  useEffect(() => {
-    if (src || !playing) return;
-    let raf = 0;
-    let last = performance.now();
-    const tick = (now: number) => {
-      const dt = (now - last) / 1000;
-      last = now;
-      let t = viewStore.state.playhead + dt * viewStore.state.playbackRate;
-      const jump = skipTarget(t, skipRanges());
-      if (jump !== null) t = jump;
-      if (t >= durationRef.current && durationRef.current > 0) {
-        setPlayhead(durationRef.current);
-        setPlaying(false);
-        return;
-      }
-      if (reachedAuditionEnd(t)) return;
-      setPlayhead(t);
-      raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [src, playing]);
 
   // --- cut-skip audio fade --------------------------------------------------
   // Fade out over the last ~50ms before an excluded range, jump silently,
@@ -152,6 +150,7 @@ export function usePlaybackEngine({ videoRef, src, ranges, duration }: PlaybackE
         } else {
           // Inside the cut: jump silently to the other side.
           v.volume = 0;
+          if (stopAtSourceEnd(v, upcoming.end)) return;
           v.currentTime = upcoming.end;
           setPlayhead(upcoming.end);
         }
@@ -171,8 +170,9 @@ export function usePlaybackEngine({ videoRef, src, ranges, duration }: PlaybackE
     if (!v) return;
     if (auditioningRef.current) return; // scrub audition: playhead stays put
     let t = v.currentTime;
-    const jump = skipTarget(t, skipRanges());
+    const jump = v.paused ? null : skipTarget(t, skipRanges());
     if (jump !== null) {
+      if (stopAtSourceEnd(v, jump)) return;
       v.currentTime = jump;
       t = jump;
     }

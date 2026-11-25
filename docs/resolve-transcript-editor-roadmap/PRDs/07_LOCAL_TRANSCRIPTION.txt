@@ -1,0 +1,52 @@
+PRD 07: OFFLINE TRANSCRIPTION AND TIMECODE ALIGNMENT
+Priority: P0 after G2
+
+GOAL
+Produce a reliable, searchable, correctable word-level transcript from locally stored dialogue audio. No required internet connection after optional setup downloads.
+
+CURRENT FOUNDATION
+core/src/adapters/transcribe.rs uses Whisper in process / whisper-cli fallback.
+core/src/adapters/align.rs provides word alignment capability.
+core/src/setup.rs pins hashes for Whisper and alignment files.
+core/src/model.rs contains Transcript/TranscriptSegment/Word models.
+frontend/src/panels/TranscriptPanel.tsx displays transcript.
+Reuse these; do not introduce second full ASR engine without benchmark evidence.
+
+REQUIREMENTS
+TR-01 On import, detect audio stream/samplerate/channel layout. P0 supports one unambiguous speech audio source. User can explicitly select channel when ambiguous.
+TR-02 Run local Whisper using validated model location. Display progress, cancel, retry and estimated memory requirements.
+TR-03 Persist language, model name/version/hash, source fingerprint, sample rate, source timecode, transcript version and per-word confidence if available.
+TR-04 Each word gets stable ID, raw text, normalized text, source_start_frame, source_end_frame, start_s/end_s derived from rational timebase, speaker ID nullable, confidence nullable.
+TR-05 Maintain speaker/segment references; changes to spelling or punctuation must not silently change timing. Editing text differs from cutting media.
+TR-06 Support correcting recognition errors inline with a clear 'Change text only' action; never interpret deletion of letters as a media cut unless Cut is explicitly invoked.
+TR-07 Provide forced alignment/re-align for words only when necessary. Preserve source audio and user corrections; show uncertain alignments.
+TR-08 Cache per media fingerprint and model version; cache invalidates on input file change or user-requested retranscription. Do not cache files outside allowed dirs.
+TR-09 Implement transcription export TXT, SRT, JSON in user-selected locations. Escape paths and prevent overwrites.
+TR-10 If Resolve native GetTranscription is supported and usable, offer optional import of existing word timings, normalize to internal model and mark provenance. SetTranscription must remain optional Studio-only and require explicit approval.
+TR-11 Silence, unrecognized speech, cross-talk and non-speech markers are shown separately; nothing is deleted automatically.
+TR-12 Transcription must not require enabling MCP, terminal, hosted model or network telemetry.
+
+TIMEBASE RULE
+Keep integer/rational source frames internally, timecode with drop-frame distinction, and immutable source-media offsets. Map from source to generated timeline only at edit/export time. Never repeatedly round seconds to frames.
+
+IMPL PATHS
+core/src/adapters/transcribe.rs
+core/src/adapters/align.rs
+core/src/model.rs
+core/src/time.rs
+core/src/setup.rs
+core/src/store.rs
+core/src/tools.rs
+frontend/src/state/transcribeStore.ts
+frontend/src/panels/TranscriptPanel.tsx
+frontend/src/panels/SetupPanel.tsx
+New: core/src/transcript_normalize.rs
+
+ACCEPTANCE
+TR-T1 Offline transcription finishes on fixture without external connections.
+TR-T2 Word timings monotonic, nonnegative, correctly aligned within measured tolerance.
+TR-T3 Playback seek from transcript maps to intended word for every frame rate fixture.
+TR-T4 Text correction does not change number of cut ranges or source timing.
+TR-T5 Crash/restart retains transcript, user corrections and model provenance.
+TR-T6 Source hash change triggers 'retranscribe or relink' instead of using stale alignment.
+TR-T7 Memory/performance recorded for 5, 30, 60 min test material.

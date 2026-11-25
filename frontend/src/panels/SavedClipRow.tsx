@@ -5,7 +5,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useStore } from "@tanstack/react-store";
-import { revealPath } from "../ipc/api";
+import { save } from "@tauri-apps/plugin-dialog";
+import { isTauri, revealPath } from "../ipc/api";
 import { useBeginClipEdit, useDeleteClip, useExportClip, useProject, useUpdateClip } from "../ipc/queries";
 import type { ExportTarget, SavedClipSummary } from "../ipc/types";
 import { previewRanges, seekTo, setCropClip, setScreen, togglePreviewCollapsed, viewStore } from "../state/viewStore";
@@ -63,8 +64,20 @@ export function SavedClipRow({
       format: clip.format === "vertical" ? "landscape" : "vertical",
     });
 
-  const runExport = (target: ExportTarget, ext: string, label: string) => {
+  const runExport = async (target: ExportTarget, ext: string, label: string) => {
     setMenuOpen(false);
+    const name = `${slugify(projectName)}-${slugify(clip.title)}.${ext}`;
+    let outPath = `~/Downloads/${name}`;
+    if (isTauri) {
+      try {
+        const selected = await save({ defaultPath: name, filters: [{ name: label, extensions: [ext] }] });
+        if (!selected) return;
+        outPath = selected;
+      } catch (error) {
+        setStatus({ text: `Export failed: ${errText(error)}` });
+        return;
+      }
+    }
     setStatus({
       text: target === "mp4" && clip.format === "vertical" ? "rendering 9:16…" : `exporting ${label}…`,
     });
@@ -73,12 +86,11 @@ export function SavedClipRow({
         project_id: projectId,
         clip_id: clip.id,
         target,
-        out_path: `~/Downloads/${slugify(projectName)}-${slugify(clip.title)}.${ext}`,
+        out_path: outPath,
       },
       {
         onSuccess: (r) => {
-          setStatus({ text: `saved ${r.path.split("/").pop()}`, path: r.path });
-          void revealPath(r.path);
+          setStatus({ text: `Saved ${r.path.split(/[\\/]/).pop() || r.path}`, path: r.path });
         },
         onError: (e) => setStatus({ text: `export failed: ${errText(e)}` }),
       },
@@ -169,8 +181,13 @@ export function SavedClipRow({
           <span className="clip-reason">
             {status.text}
             {status.path && (
-              <button className="reveal-btn" onClick={() => void revealPath(status.path!)}>
-                reveal
+              <button className="reveal-btn" onClick={() => {
+                const path = status.path;
+                if (!path) return;
+                void revealPath(path).catch((error) => setStatus((current) => current?.path === path
+                  ? { ...current, text: errText(error) } : current));
+              }}>
+                Reveal
               </button>
             )}
           </span>
@@ -223,8 +240,8 @@ export function SavedClipRow({
         </button>
         {menuOpen && (
           <div className={`export-dropdown${menuUp ? " up" : ""}`}>
-            {EXPORT_TARGETS.map((t) => (
-              <button key={t.target} className="export-item" onClick={() => runExport(t.target, t.ext, t.label)}>
+            {EXPORT_TARGETS.filter((target) => target.target !== "transcript_json").map((t) => (
+              <button key={t.target} className="export-item" onClick={() => void runExport(t.target, t.ext, t.label)}>
                 {t.target === "mp4" ? `MP4 (${FORMAT_LABEL[clip.format]})` : t.label}
               </button>
             ))}

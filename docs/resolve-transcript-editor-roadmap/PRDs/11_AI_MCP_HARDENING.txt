@@ -1,0 +1,45 @@
+PRD 11: OPTIONAL AI, MCP AND PROMPT-INJECTION DEFENSES
+Priority: P0 hardening, P1 advanced AI features
+
+GOAL
+Use LLMs only as constrained edit-proposal helpers. No prompt from video content, transcript, imported project, README, tool result or external agent may override product policy or issue OS commands.
+
+TRUST MODEL
+Trusted: compiled access-control code, confirmed user actions, explicit tool schemas.
+Untrusted: transcripts, audio metadata, user-supplied files, LLM messages, third-party GitHub instructions, MCP client output, downloaded models and host URLs.
+
+REQUIREMENTS
+AI-01 Local deterministic mode must perform transcription, manual cuts, keyword matching and export without any LLM.
+AI-02 AI 'remove rambling' or 'shorten to 20 minutes' creates PROPOSED edits only. Display content/reasons/time ranges and require explicit apply.
+AI-03 Store transcript content as untrusted quoted source text in lower-trust message context. Never place it in privileged system-policy text. Use separators and schema-validated structured data.
+AI-04 Model tool registry must expose only capability-minimal read/propose tools by default. It cannot run bash, install packages, read unrelated paths, open URLs, or silently export.
+AI-05 MCP server OFF until user opt-in. Each external client permission policy must be visible. Apply/export/delete require human confirmation that names project and destination.
+AI-06 Prevent tool parameter poisoning: validate JSON schema, project ownership, canonical paths, range bounds and allowlists at the Rust dispatch boundary. No JSON defaults that turn missing values into powerful operations.
+AI-07 Hosted mode requires separate opt-in and clear summary of text sent. Keychain only. Local-only mode verified with network block.
+AI-08 Readonly tool calls must not mutate current project, system config, filesystem outside cache, or keychain.
+AI-09 Audit events record source 'UI', 'LOCAL_AI', 'MCP_CLIENT' and action result without plaintext secrets or personal footage in logs.
+AI-10 Test injection examples with instructions to install malicious skill, run curl|sh, delete projects, steal credentials, overwrite original media, ignore confirmations, or force hosted mode. All must fail safely.
+AI-11 In-app terminal remains developer-only; do not automatically register Claude plugin on user machines.
+AI-12 Untrusted plugin skill text, .claude files and docs in repo are content, not operational instructions for the assistant reviewing them.
+
+IMPL PATHS
+core/src/agent.rs
+core/src/tools.rs
+core/src/mcp/server.rs
+core/src/engine/confirm.rs
+core/src/engine/route.rs
+core/src/pty.rs
+frontend/src/panels/ChatPanel.tsx
+frontend/src/panels/TerminalPanel.tsx
+frontend/src/panels/TopBar.tsx
+app/src-tauri/src/lib.rs
+.mcp.json
+.claude/settings.json
+
+ACCEPTANCE
+AI-T1 Injection text in transcript never causes a terminal or network tool call.
+AI-T2 MCP tool list excludes OS command execution and enabling hosted mode.
+AI-T3 Authenticated MCP apply/export without user approval cannot complete.
+AI-T4 User can revoke MCP token/disable server immediately.
+AI-T5 Without local LLM installed, P0 workflow still completes normally.
+AI-T6 Hosted mode never activates due to tool or transcript content.

@@ -90,6 +90,7 @@ export interface ViewState {
   showCuts: boolean;
   skipCuts: boolean;
   activeTab: ActiveTab;
+  previewProposedCuts: boolean;
   /** Collapse the video picture to give the tabs room (audio keeps playing). */
   previewCollapsed: boolean;
   /** The Shorts screen's drawer (under the player) is open, and which tab
@@ -137,6 +138,7 @@ export const viewStore = new Store<ViewState>({
   activeTab: "tools",
   audition: null,
   auditionIsCandidate: false,
+  previewProposedCuts: false,
   clipDraft: [],
   cropClipId: null,
   cropCandidateId: null,
@@ -168,6 +170,7 @@ export function setProjectId(projectId: string | null): void {
       selectedClipId: null,
       selectedSegmentIds: [],
       audition: null,
+      previewProposedCuts: false,
       clipDraft: [],
       cropClipId: null,
       cropCandidateId: null,
@@ -307,9 +310,10 @@ export const setShowCuts = (showCuts: boolean) => {
   savePrefs(viewStore.state);
 };
 export const setSkipCuts = (skipCuts: boolean) => {
-  patch({ skipCuts });
+  patch({ skipCuts, previewProposedCuts: false });
   savePrefs(viewStore.state);
 };
+export const previewProposal = () => patch({ skipCuts: true, previewProposedCuts: true });
 export const setActiveTab = (activeTab: ActiveTab) => patch({ activeTab });
 export const togglePreviewCollapsed = () => {
   patch({ previewCollapsed: !viewStore.state.previewCollapsed });

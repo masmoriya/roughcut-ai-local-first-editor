@@ -60,6 +60,8 @@ pub fn fixture_transcript(media: &Media) -> Transcript {
         let dur = weights[i] * scale;
         if *line == "[silence]" {
             segments.push(TranscriptSegment {
+                original_text: None,
+                speaker: None,
                 id: Uuid::new_v4(),
                 start: t,
                 end: t + dur,
@@ -77,6 +79,7 @@ pub fn fixture_transcript(media: &Media) -> Transcript {
                 .iter()
                 .enumerate()
                 .map(|(wi, w)| Word {
+                    original_text: None,
                     text: (*w).to_string(),
                     start: t + wi as f64 * per,
                     end: t + (wi as f64 + 0.92) * per,
@@ -88,6 +91,8 @@ pub fn fixture_transcript(media: &Media) -> Transcript {
                 take_pair.push(segments.len());
             }
             segments.push(TranscriptSegment {
+                original_text: None,
+                speaker: None,
                 id: Uuid::new_v4(),
                 start: t,
                 end: t + dur,
@@ -119,5 +124,7 @@ pub fn fixture_transcript(media: &Media) -> Transcript {
         model_used: "demo-fixture".into(),
         words_trimmed: false,
         words_aligned: false,
+        source_fingerprint: None,
+        source_audio_stream_index: None,
     }
 }

@@ -1,0 +1,28 @@
+SOURCES AND VERIFICATION NOTES
+As of: 2026-11-11
+
+PRIMARY UPSTREAM
+RoughCut repository: https://github.com/PaulBratslavsky/roughcut-ai-local-first-editor
+Reviewed HEAD: 224753a7a9c2a8d998248bff1046e9d56604071d
+Core README: https://github.com/PaulBratslavsky/roughcut-ai-local-first-editor/blob/main/README.md
+Resolve integration: https://github.com/PaulBratslavsky/roughcut-ai-local-first-editor/tree/main/resolve-plugin
+License: https://github.com/PaulBratslavsky/roughcut-ai-local-first-editor/blob/main/LICENSE
+Tauri security: https://github.com/PaulBratslavsky/roughcut-ai-local-first-editor/blob/main/app/src-tauri/tauri.conf.json
+Runtime installer: https://github.com/PaulBratslavsky/roughcut-ai-local-first-editor/blob/main/core/src/llm_runtime.rs
+MCP service: https://github.com/PaulBratslavsky/roughcut-ai-local-first-editor/blob/main/core/src/mcp/server.rs
+Agent: https://github.com/PaulBratslavsky/roughcut-ai-local-first-editor/blob/main/core/src/agent.rs
+
+DAVINCI DOCUMENTATION
+Resolve installed documentation: Help > Documentation > Developer > Scripting, and Workflow Integrations. Treat locally installed official documentation as authority for the exact target build.
+Resolve 21.1.2 transcription object reference: https://wheheohu.github.io/bmd_doc/ResolveAPI/21.1.2/resolve_settings/Transcription
+Studio and AI Scripting API restrictions: https://wheheohu.github.io/bmd_doc/ResolveAPI/21.1.2/resolve_settings/StudioAndAIScriptingAPIs
+Resolve API media item: https://wheheohu.github.io/bmd_doc/ResolveAPI/21.1.2/resolve_api/MediaPoolItem
+Workflow Integrations Studio-only documented by partner and manual sources. Test actual host/edition:
+https://docs.imaster.org/davinci-resolve-21-manual/part-18-advanced-workflows/ch.-201-workflow-integrations
+https://help.layer.ai/articles/3670880745-install-davinci-resolve-plugin
+
+GPL FAQ
+https://www.gnu.org/licenses/gpl-faq.en.html
+
+EVIDENCE STATUS
+Source code files were statically inspected during prior security review and current HEAD was rechecked on 2026-11-11. The source was NOT compiled or executed during creation of this PRD package. No actual DaVinci Resolve install was tested. Assertions about supported Resolve features are planning assumptions until a live version/edition-specific proof is saved. The previous security review found risks; it did not demonstrate exploitability or malware. This package contains no runnable code and does not install software.

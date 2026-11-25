@@ -1,0 +1,47 @@
+PRD 13: ONE-CLICK INSTALLER, UPDATE POLICY AND PRIVACY
+Priority: P1 after end-to-end prototype passes
+
+GOAL
+Deliver a safe macOS installation for the desktop app and optional per-user Resolve integration without privileged scripts or hidden downloads.
+
+DEFAULT SETUP
+A signed/notarized .dmg for the desktop application after release gates.
+An explicit 'Install Resolve Scripts' button that copies only audited Python files to the documented per-user Scripts/Utility directory, after previewing source/destination and asking permission.
+Optional Whisper model download on user's command, with pinned SHA-256 and download progress. ffmpeg installation method must be explained and verified; do not silently run brew install.
+Managed llama.cpp/LLM setup is optional, never needed for deterministic P0 functionality.
+
+REQUIREMENTS
+PK-01 Build and bundle from pinned SHA with SBOM and release manifest.
+PK-02 Build type release removes developer terminal and dangerous bypass toggles unless explicitly enabled in development-only builds.
+PK-03 Installer requests only needed macOS permissions. No default Full Disk Access.
+PK-04 Script installer makes backup of any pre-existing same-named script and supports uninstall. Never clobber another vendor's file or unknown user customizations.
+PK-05 Installation does not modify a Resolve project. Users must choose a script action separately from Resolve.
+PK-06 Online update checks, if added, require clear opt-in and verified signatures. No unreviewed auto-update executables.
+PK-07 Local model download displays model name, hash, approximate storage, source, license, and consent.
+PK-08 Crash and usage telemetry OFF by default. Separate opt-in with data description and retention policy if ever introduced.
+PK-09 Show local vs hosted mode prominently. No mandatory account for MVP.
+PK-10 Uninstaller removes only installed application files and scripts it owns; preserve user projects and models unless user explicitly checks delete data.
+PK-11 Provide changelog, known limitations, rollback installer and migration path for saved projects.
+PK-12 Windows support is not a requirement until macOS security/Resolve integration proven; do not mark CI compilation as Windows functionality.
+
+IMPL PATHS
+app/src-tauri/tauri.conf.json
+app/src-tauri/src/lib.rs
+core/src/resolve.rs
+resolve-plugin/install.sh
+resolve-plugin/README.md
+frontend/src/panels/SetupPanel.tsx
+.github/workflows/release.yml
+scripts/build-macos-app.sh
+New: docs/resolve-transcript-editor/INSTALL.txt
+New: docs/resolve-transcript-editor/PRIVACY.txt
+New: docs/resolve-transcript-editor/UNINSTALL.txt
+New: docs/resolve-transcript-editor/RELEASE_MANIFEST.txt
+
+ACCEPTANCE
+PK-T1 Signed/notarized install on clean macOS without disabling Gatekeeper.
+PK-T2 App launches with no full-disk permission and asks only for user-selected media.
+PK-T3 Install/reinstall/uninstall scripts do not clobber unrelated files.
+PK-T4 Offline workflow works after user has installed models and ffmpeg.
+PK-T5 Update/migration preserves user projects and cut plans.
+PK-T6 Release artifact hash, SBOM, license notices and tested Resolve versions published.

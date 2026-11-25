@@ -1,29 +1,18 @@
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { ask } from "@tauri-apps/plugin-dialog";
-import { onAppEvent } from "./ipc/api";
-import type { ConfirmRequestEvent, ProjectOpenedEvent } from "./ipc/types";
 import { useStore } from "@tanstack/react-store";
-import { useQueryClient } from "@tanstack/react-query";
-import { getDemoMode, isTauri } from "./ipc/api";
-import { queryKeys, useCoreEventInvalidation, useProject, useProjects, useTranscript } from "./ipc/queries";
+import { isTauri } from "./ipc/api";
+import { useCoreEventInvalidation, useProject, useProjects, useTranscript } from "./ipc/queries";
 import { useEditorKeyboard } from "./hooks/useEditorKeyboard";
 import { setActiveTab, setProjectId, viewStore } from "./state/viewStore";
 import { useShortsProgressListener } from "./state/shortsStore";
-import { useModelStatusSync } from "./state/modelStore";
 import { EmptyState } from "./EmptyState";
 import { ClipsScreen } from "./panels/ClipsScreen";
-import { ShortsScreen } from "./panels/ShortsScreen";
 import { TopBar } from "./panels/TopBar";
 import { TranscriptPanel } from "./panels/TranscriptPanel";
-import { ChatPanel } from "./panels/ChatPanel";
-import { ClipsPanel } from "./panels/ClipsPanel";
 import { FootagePanel } from "./panels/FootagePanel";
 import { HistoryPanel } from "./panels/HistoryPanel";
-import { TerminalPanel } from "./panels/TerminalPanel";
 import { PreviewPanel } from "./panels/PreviewPanel";
 import { InspectorPanel } from "./panels/InspectorPanel";
-import { MetadataPanel } from "./panels/MetadataPanel";
 import { Timeline } from "./timeline/Timeline";
 import { TransportBar } from "./timeline/TransportBar";
 import { ClipEditBar } from "./panels/ClipEditBar";
@@ -89,7 +78,7 @@ function Editor({ projectId }: { projectId: string }) {
       <ClipEditBar projectId={projectId} />
       <main className="main-row">
         <section className="left-panel card light">
-          <TranscriptPanel projectId={projectId} />
+          <TranscriptPanel key={projectId} projectId={projectId} />
         </section>
         <aside className="right-col">
           <PreviewPanel projectId={projectId} />
@@ -100,18 +89,6 @@ function Editor({ projectId }: { projectId: string }) {
                 onClick={() => setActiveTab("tools")}
               >
                 Tools
-              </button>
-              <button
-                className={`tab${activeTab === "chat" ? " active" : ""}`}
-                onClick={() => setActiveTab("chat")}
-              >
-                Chat
-              </button>
-              <button
-                className={`tab${activeTab === "clips" ? " active" : ""}`}
-                onClick={() => setActiveTab("clips")}
-              >
-                Clips
               </button>
               <button
                 className={`tab${activeTab === "footage" ? " active" : ""}`}
@@ -125,27 +102,14 @@ function Editor({ projectId }: { projectId: string }) {
               >
                 History
               </button>
-              <button
-                className={`tab${activeTab === "terminal" ? " active" : ""}`}
-                onClick={() => setActiveTab("terminal")}
-              >
-                Terminal
-              </button>
             </div>
-            {activeTab === "chat" ? (
-              <ChatPanel projectId={projectId} />
-            ) : activeTab === "clips" ? (
-              <ClipsPanel projectId={projectId} />
-            ) : activeTab === "footage" ? (
+            {activeTab === "footage" ? (
               <FootagePanel projectId={projectId} />
             ) : activeTab === "history" ? (
               <HistoryPanel projectId={projectId} />
-            ) : activeTab === "terminal" ? (
-              <TerminalPanel />
             ) : (
               <div className="tools-scroll">
                 <InspectorPanel projectId={projectId} />
-                <MetadataPanel projectId={projectId} />
               </div>
             )}
           </div>
@@ -156,23 +120,6 @@ function Editor({ projectId }: { projectId: string }) {
         <TransportBar projectId={projectId} />
         <Timeline projectId={projectId} />
       </footer>
-    </div>
-  );
-}
-
-/** Honest labelling: when the backend is on fixture adapters, say so —
- *  otherwise demo footage reads as "the app is broken". */
-function DemoBanner() {
-  const [demo, setDemo] = useState(false);
-  useEffect(() => {
-    void getDemoMode().then(setDemo).catch(() => setDemo(false));
-  }, []);
-  if (!demo) return null;
-  return (
-    <div className="demo-banner">
-      {isTauri
-        ? "Demo mode — editing fixture footage. Finish setup (ffmpeg + speech model) to use your own video."
-        : "Browser demo — running on fixture data. The desktop app edits real footage."}
     </div>
   );
 }
@@ -194,41 +141,10 @@ function useSuppressDefaultContextMenu() {
   }, []);
 }
 
-function useExternalConfirmations() {
-  useEffect(() => {
-    if (!isTauri) return;
-    return onAppEvent<ConfirmRequestEvent>("confirm-request", (req) => {
-      void ask(req.summary, { title: "External request", kind: "warning" }).then((approved) =>
-        invoke("confirm_action", { id: req.id, approved }),
-      );
-    });
-  }, []);
-}
-
-/** "Open X" asked of Claude Code (or any MCP client) switches the app to X.
- *  The screen stays as it is: the Shorts screen shows X's shorts. */
-function useExternalProjectOpen() {
-  const queryClient = useQueryClient();
-  useEffect(() => {
-    if (!isTauri) return;
-    return onAppEvent<ProjectOpenedEvent>("project-opened", (e) => {
-      // Refresh the list first: App falls back to the newest project when the
-      // pick isn't in it, which would undo the switch for a brand-new project.
-      void queryClient
-        .invalidateQueries({ queryKey: queryKeys.projects })
-        .then(() => setProjectId(e.project_id));
-    });
-  }, [queryClient]);
-}
-
 export default function App() {
   useCoreEventInvalidation();
   // Scan / make / export progress, kept per project while any screen shows.
   useShortsProgressListener();
-  // The LOCAL / HOSTED status, for the chip and every mode-aware string.
-  useModelStatusSync();
-  useExternalConfirmations();
-  useExternalProjectOpen();
   useSuppressDefaultContextMenu();
   const projects = useProjects();
   const selected = useStore(viewStore, (s) => s.projectId);
@@ -242,6 +158,17 @@ export default function App() {
     setProjectId(projectId);
   }, [projectId]);
 
+  if (!isTauri) {
+    return <div className="app-loading">Open RoughCut in the desktop app to edit your timeline.</div>;
+  }
+  if (projects.isError && !projects.data) {
+    return (
+      <div className="app-loading">
+        <span role="alert">Couldn’t load your projects.</span>
+        <button className="ghost-btn" onClick={() => void projects.refetch()}>Retry</button>
+      </div>
+    );
+  }
   if (projects.isLoading) {
     return (
       <div className="app-loading">
@@ -250,20 +177,9 @@ export default function App() {
     );
   }
 
-  if (screen === "shorts" || screen === "clips") {
-    const Screen = screen === "shorts" ? ShortsScreen : ClipsScreen;
-    return (
-      <>
-        <DemoBanner />
-        {projectId ? <Screen key={projectId} projectId={projectId} /> : <EmptyState />}
-      </>
-    );
+  if (screen === "clips") {
+    return projectId ? <ClipsScreen key={projectId} projectId={projectId} /> : <EmptyState />;
   }
 
-  return (
-    <>
-      <DemoBanner />
-      {projectId ? <Editor projectId={projectId} /> : <EmptyState />}
-    </>
-  );
+  return projectId ? <Editor projectId={projectId} /> : <EmptyState />;
 }

@@ -37,9 +37,8 @@ import {
   togglePicked,
 } from "../state/shortsStore";
 import { CandidateCard } from "./CandidateCard";
-import { errText, scoredBy, useSecondsSince } from "./clipUtil";
-import { modelLabel, useModelStatus } from "../state/modelStore";
-import { PlayerDrawer } from "./PlayerDrawer";
+import { errText, useSecondsSince } from "./clipUtil";
+import { modelLabel, scoredBy, useModelStatus } from "../state/modelStore";
 import { PreviewPanel } from "./PreviewPanel";
 import { TaskLine } from "./TaskLine";
 import { TopBar } from "./TopBar";
@@ -129,7 +128,6 @@ export function ShortsScreen({ projectId }: { projectId: string }) {
             Click a card's picture to play it here · Space plays / pauses. The 9:16 window shows its short's
             frame: drag it to move it, drag a corner to zoom in. Left alone, making it frames the crop on the speaker.
           </p>
-          <PlayerDrawer projectId={projectId} />
         </section>
 
         <section className="shorts-main">

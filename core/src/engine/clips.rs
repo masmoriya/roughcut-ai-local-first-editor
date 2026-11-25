@@ -287,6 +287,9 @@ impl Editor {
     /// only moves the crop if nobody changed it meanwhile (a drag in the
     /// preview wins). Failures are silent: the clip keeps its crop.
     pub fn auto_center_clip(&self, project_id: Uuid, clip_id: Uuid) {
+        if !self.inference_enabled() {
+            return;
+        }
         let Ok(clip) = self.get_clip(project_id, clip_id) else { return };
         let editor = self.clone();
         tokio::spawn(async move {

@@ -5,13 +5,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "@tanstack/react-store";
 import { isTauri, playbackSrc } from "../ipc/api";
-import { useMediaAssets, useProject, useTimeline } from "../ipc/queries";
+import { useMediaAssets, useProject, useTimeline, useTranscript } from "../ipc/queries";
+import { errText } from "./clipUtil";
 import { registerAudibleElement } from "../playback/meter";
 import { usePlaybackEngine } from "../playback/engine";
-import { excludedRanges, excludedTotal, toEditedTime, type Range } from "../playback/time";
+import { excludedRanges, excludedTotal, mergeRanges, overlapsRange, toEditedTime, type Range } from "../playback/time";
 import { CandidateCropGuide, CropGuide } from "./CropGuide";
 import {
   seekTo,
+  setActiveTab,
   setPlaybackRate,
   setPlaying,
   setSkipCuts,
@@ -35,7 +37,7 @@ export function PreviewPanel({
    *  picture, to frame (drag, zoom) before it's made. */
   shortsGuide?: boolean;
 }) {
-  const { data: project } = useProject(projectId);
+  const { data: project, isFetching: checkingProject, refetch: refetchProject } = useProject(projectId);
   const { data: timeline } = useTimeline(projectId);
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
@@ -43,39 +45,59 @@ export function PreviewPanel({
   const rate = useStore(viewStore, (s) => s.playbackRate);
   const playhead = useStore(viewStore, (s) => s.playhead);
   const skipCuts = useStore(viewStore, (s) => s.skipCuts);
+  const previewProposedCuts = useStore(viewStore, (s) => s.previewProposedCuts);
+  const previewingProposal = previewProposedCuts && !!project?.cut_proposal?.cuts.length;
   const collapsed = useStore(viewStore, (s) => s.previewCollapsed);
 
   const duration = timeline?.duration ?? project?.media?.duration ?? 0;
   // Some sources can't stream in a <video> tag (more than 2 audio channels, an
   // OBS .mkv); the core then builds a playable copy in the background and
   // media-assets-changed swaps it in.
-  const { data: assets } = useMediaAssets(projectId);
+  const { data: transcript, isError: transcriptFailed, refetch: refetchTranscript } = useTranscript(projectId);
+  const trackCount = (project?.media as { source_audio_tracks?: number } | undefined)?.source_audio_tracks ?? 0;
+  const waitingForTrack = trackCount > 1 && !project?.resolve_timeline && transcript === undefined;
+  const selectedStream = trackCount > 1
+    ? project?.resolve_timeline?.dialogue_stream_index
+      ?? (transcript as { source_audio_stream_index?: number } | undefined)?.source_audio_stream_index
+    : undefined;
+  const { data: assets, error: mediaError, isFetching: checkingMedia, refetch: refetchMedia } = useMediaAssets(projectId);
   const preparing =
     isTauri &&
     !!project?.media &&
     !assets?.playback_path &&
-    !/\.(mp4|mov|m4v)$/i.test(project.media.file_path);
+    (selectedStream !== undefined || !/\.(mp4|mov|m4v)$/i.test(project.media.file_path));
   const src = useMemo(() => {
-    if (!project?.media) return null;
+    if (!project?.media || mediaError || waitingForTrack) return null;
+    if (selectedStream !== undefined && !assets?.playback_path) return null;
     const path = assets?.playback_path ?? project.media.file_path;
     if (!isTauri && !path.startsWith("http")) return null;
     return playbackSrc(path);
-  }, [project?.media, assets?.playback_path]);
-  // What playback skips: the cuts, plus proposed cuts not skipped — so
-  // playing previews the edit as it would be once applied.
+  }, [project?.media, assets?.playback_path, selectedStream, mediaError, waitingForTrack]);
+  // Normal edited playback matches export. The review panel can audition
+  // proposed cuts without applying them.
   const ranges = useMemo<Range[]>(() => {
     const cuts = excludedRanges(timeline?.clips ?? []);
+    if (!previewingProposal) return cuts;
     const proposed = (project?.cut_proposal?.cuts ?? [])
-      .filter((c) => !c.skipped)
+      .filter((c) => !c.skipped && !overlapsRange(c, project?.protected_ranges))
       .map((c) => ({ start: c.start, end: c.end }));
-    return proposed.length ? [...cuts, ...proposed].sort((a, b) => a.start - b.start) : cuts;
-  }, [timeline, project?.cut_proposal]);
+    return proposed.length ? mergeRanges([...cuts, ...proposed]) : cuts;
+  }, [timeline, project?.cut_proposal, project?.protected_ranges, previewingProposal]);
 
   const { onTimeUpdate } = usePlaybackEngine({ videoRef, src, ranges, duration });
   const [videoError, setVideoError] = useState<string | null>(null);
   // Until the copy lands, a file WebKit can't open just fails: say it's
   // being prepared instead of showing a player error.
   const [loaded, setLoaded] = useState(false);
+  const retryPreview = async () => {
+    const savedProject = await refetchProject();
+    if (!savedProject.isSuccess) return;
+    const refreshed = await refetchMedia();
+    if (!refreshed.isSuccess) return;
+    setVideoError(null);
+    setLoaded(false);
+    videoRef.current?.load();
+  };
   useEffect(() => {
     // A new source (the copy landing) starts clean: the original's error
     // mustn't flash while the copy loads.
@@ -265,14 +287,27 @@ export function PreviewPanel({
               <path d="M2 8h20M2 16h20M7 4v16M17 4v16M7 8v4M17 8v4M7 16v4M17 16v4" opacity="0.55" />
               <path d="M10.5 10.2v3.6l3.2-1.8z" fill="currentColor" stroke="none" />
             </svg>
-            <span>Demo footage (mock mode)</span>
+            {!project?.media && <span>No source footage</span>}
           </div>
         )}
 
-        {preparing && !loaded && assets?.playback_error ? (
+        {waitingForTrack ? (
+          transcriptFailed ? (
+            <div className="preview-error">
+              <span role="alert">Couldn’t check the dialogue track.</span>
+              <button type="button" className="link-btn" onClick={() => void refetchTranscript()}>Retry</button>
+            </div>
+          ) : <div className="preview-preparing" role="status">Checking dialogue track…</div>
+        ) : mediaError ? (
+          <div className="preview-error">
+            <span role="alert">{errText(mediaError)}</span>
+            <button type="button" className="link-btn" disabled={checkingProject || checkingMedia}
+              onClick={() => void retryPreview()}>{checkingProject || checkingMedia ? "Checking…" : "Retry preview"}</button>
+            <button type="button" className="link-btn" onClick={() => setActiveTab("footage")}>Open footage</button>
+          </div>
+        ) : preparing && !loaded && assets?.playback_error ? (
           <div className="preview-error" role="alert">
-            Couldn't make a copy this player can open: {assets.playback_error}. Editing,
-            transcription and export still use the original file.
+            Couldn't prepare preview: {assets.playback_error}. Editing and export use the original file.
           </div>
         ) : preparing && !loaded ? (
           <div className="preview-preparing" role="status">
@@ -280,8 +315,10 @@ export function PreviewPanel({
           </div>
         ) : (
           videoError && (
-            <div className="preview-error" role="alert">
-              {videoError}
+            <div className="preview-error">
+              <span role="alert">{videoError}</span>
+              <button type="button" className="link-btn" disabled={checkingProject || checkingMedia}
+                onClick={() => void retryPreview()}>{checkingProject || checkingMedia ? "Checking…" : "Retry preview"}</button>
             </div>
           )
         )}
@@ -354,19 +391,22 @@ export function PreviewPanel({
         <span className="cut-counter">{timeline?.cut_count ?? 0} Cuts</span>
         <div className="preview-version-toggle" role="group" aria-label="Preview version">
           <button
-            className={skipCuts ? "active" : ""}
+            className={skipCuts && !previewingProposal ? "active" : ""}
+            aria-pressed={skipCuts && !previewingProposal}
             title="Watch the edited cut (skips removed sections)"
             onClick={() => setSkipCuts(true)}
           >
-            Cut · {fmt(editedTotal)}
+            Edited
           </button>
           <button
             className={!skipCuts ? "active" : ""}
+            aria-pressed={!skipCuts}
             title="Watch the original footage (plays through cuts)"
             onClick={() => setSkipCuts(false)}
           >
-            Original · {fmt(duration)}
+            Original
           </button>
+          {previewingProposal && <span role="status">Proposed cuts</span>}
         </div>
         <span className="time-readout">
           {fmt(shownCurrent)} <span className="time-sep">/</span> {fmt(shownTotal)}

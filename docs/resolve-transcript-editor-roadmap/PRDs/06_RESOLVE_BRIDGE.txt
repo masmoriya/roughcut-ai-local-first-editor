@@ -1,0 +1,61 @@
+PRD 06: SAFE RESOLVE BRIDGE AND PROJECT IDENTITY
+Priority: P0 after G2
+
+GOAL
+Replace implicit guessing in the existing Resolve scripts with explicit, testable project/media selection, stable handshake, and safe import.
+
+CURRENT BEHAVIOR TO CORRECT
+RoughCut AI Draft.py selects a media-pool clip or may fall back to the first clip in the root folder. This is unsafe when selection is ambiguous.
+RoughCut Import Cut.py uses projects[0] (most recently edited) rather than a selected/project-matched cut. This can import the wrong work.
+Script reads mcp.json URL/token and calls localhost endpoint. Verify endpoint.
+Current pipeline transcribes, applies rough cut, exports xmeml, calls ImportTimelineFromFile. Preserve working core; change unsafe defaults.
+
+REQUIREMENTS
+BR-01 In Resolve, require one explicit selected MediaPoolItem for draft. If no unique selection, explain how to select; never guess.
+BR-02 Show proposed project name, original media name/path, source length, and targeted new timeline name before executing.
+BR-03 Create one stable mapping: resolve project ID (if available), media pool item ID or fingerprint, absolute/canonical source path, media content hash or size/mtime, RoughCut project UUID, output XML UUID, generated timeline name.
+BR-04 For Import Cut, display list of RoughCut projects with ID, media fingerprint, last edited, target source, and currently selected candidate. User chooses. Never assume list index 0.
+BR-05 Validate returned endpoint is HTTP loopback only (host 127.0.0.1, approved port and /mcp). Reject arbitrary URL in discovery JSON.
+BR-06 Cross-restart token and version handshake; return actionable 'server offline', 'auth missing', 'version mismatch', 'source changed', 'Resolve API unavailable'.
+BR-07 Any operation that sends data into Resolve must create a NEW named timeline, with unique suffix, in a selected bin. Never overwrite source files or edit existing timeline implicitly.
+BR-08 Export XML to selected application-controlled temp folder using unique run ID; clean stale outputs safely after TTL; log metadata not footage content.
+BR-09 Allow explicit re-import after an edit. Show what changed and where in Resolve it will land. Roll back by deleting generated timeline only with user confirmation.
+BR-10 Preserve audio/video linkage. If multiple audio tracks, sync drift, offline paths or unsupported effects encountered, fail with precise scope warning.
+BR-11 Add a 'dry run' that outputs manifest, cuts and XML path but does not touch Resolve.
+
+NEW DATA
+BridgeManifest:
+- bridge_version
+- roughcut_project_id
+- resolve_project_id nullable
+- resolve_media_item_id nullable
+- source_media_fingerprint
+- source_file_path
+- source_fps_num / source_fps_den
+- source_timecode_start
+- timeline_name
+- timeline_frame_rate
+- cut_plan_version
+- xml_output_path
+- created_at
+- import_status and error
+
+IMPL LOCATIONS
+resolve-plugin/RoughCut AI Draft.py
+resolve-plugin/RoughCut Import Cut.py
+resolve-plugin/README.md
+core/src/resolve.rs
+core/src/export/xmeml.rs
+core/src/model.rs
+core/src/tools.rs
+frontend/src/panels/ExportMenu.tsx
+New: core/src/bridge_manifest.rs
+New: tests/resolve_integration/test_bridge_contract.py
+
+ACCEPTANCE
+BR-T1 Selected clip A can never cause clip B import if B is alphabetically first or last-edited.
+BR-T2 Import Cut shows explicit project choice; rejecting means no export/import.
+BR-T3 Resolve original timeline and original files unchanged, verified by hashes and timeline count.
+BR-T4 Media with Unicode, spaces, and commas in path relinks.
+BR-T5 Stale token, app offline, Resolve absent produce clear errors and no partial import.
+BR-T6 Repeated request is idempotent with unique job ID; no duplicate background edits.

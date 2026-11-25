@@ -1,6 +1,5 @@
 // Canvas timeline: ruler, clip blocks, waveform + thumbnails, playhead.
-// Real peaks and thumbnails come from get_media_assets; the seeded waveform
-// in renderer.ts is only a fallback until they load.
+// Peaks and thumbnails come from get_media_assets.
 // Interactions: click/drag to seek, edge-drag to trim (-> trim_clip),
 // wheel to zoom around the playhead / horizontal scroll.
 
@@ -8,6 +7,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "@tanstack/react-store";
 import { useCutRange, useMediaAssets, useProject, useRestoreRange, useSplitClip, useTimeline, useTrimClip } from "../ipc/queries";
 import type { Clip } from "../ipc/types";
+import { errText } from "../panels/clipUtil";
+import { overlapsRange } from "../playback/time";
 import { loadTimelineAssets, type TimelineAssets } from "./assets";
 import {
   fitTimelineToWidth,
@@ -34,12 +35,15 @@ interface DragState {
 export function Timeline({ projectId }: { projectId: string }) {
   const { data: timeline } = useTimeline(projectId);
   const { data: project } = useProject(projectId);
-  const { data: assetMeta, isLoading: assetsGenerating } = useMediaAssets(projectId);
+  const {
+    data: assetMeta, isLoading: assetsGenerating,
+    isFetching: assetsFetching, isError: assetsFailed, refetch: refetchAssets,
+  } = useMediaAssets(projectId);
   // Proposed cuts (skipped ones aren't drawn), read by the draw loop.
   const proposedRef = useRef<{ id: number; start: number; end: number }[]>([]);
   proposedRef.current = useMemo(
-    () => (project?.cut_proposal?.cuts ?? []).filter((c) => !c.skipped),
-    [project?.cut_proposal],
+    () => (project?.cut_proposal?.cuts ?? []).filter((c) => !c.skipped && !overlapsRange(c, project?.protected_ranges)),
+    [project?.cut_proposal, project?.protected_ranges],
   );
   const trimClip = useTrimClip();
   const cutRange = useCutRange();
@@ -47,11 +51,24 @@ export function Timeline({ projectId }: { projectId: string }) {
   const splitClip = useSplitClip();
 
   // Right-click menu on a clip: Restore for cut clips, Cut/Split for kept.
-  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; clip: Clip } | null>(null);
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; clip: Clip; keyboard?: boolean } | null>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [editError, setEditError] = useState("");
+  const runClipAction = (action: Promise<unknown>) => {
+    setEditError("");
+    if (ctxMenu?.keyboard) canvasRef.current?.focus({ preventScroll: true });
+    setCtxMenu(null);
+    void action.catch((error) => setEditError(errText(error)));
+  };
   useEffect(() => {
     if (!ctxMenu) return;
     const close = () => setCtxMenu(null);
-    const onKey = (ev: KeyboardEvent) => ev.key === "Escape" && close();
+    if (ctxMenu.keyboard) menuRef.current?.querySelector("button")?.focus();
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key !== "Escape") return;
+      close();
+      if (ctxMenu.keyboard) canvasRef.current?.focus({ preventScroll: true });
+    };
     window.addEventListener("mousedown", close);
     window.addEventListener("keydown", onKey);
     window.addEventListener("scroll", close, true);
@@ -93,20 +110,26 @@ export function Timeline({ projectId }: { projectId: string }) {
     fitTimelineToWidth(viewStore.state.showCuts || plays <= 0 ? dur : plays, w);
   }, [projectId, timeline?.id, timeline?.duration, timeline?.clips, fitNonce]);
 
-  // Real waveform peaks + thumbnails: fetched over the asset protocol once
-  // the core reports them; the renderer falls back to synthetic bars until then.
+  // Fetch waveform peaks and thumbnails over the asset protocol.
   const [assets, setAssets] = useState<TimelineAssets | null>(null);
+  const [loadingAssets, setLoadingAssets] = useState(false);
+  const [assetRetry, setAssetRetry] = useState(0);
   const assetsRef = useRef<TimelineAssets | null>(null);
   assetsRef.current = assets;
   useEffect(() => {
     let cancelled = false;
     setAssets(null);
+    setLoadingAssets(Boolean(assetMeta));
     if (!assetMeta) return;
-    void loadTimelineAssets(assetMeta).then((loaded) => {
-      if (!cancelled) setAssets(loaded);
+    void loadTimelineAssets(assetMeta, (peaks) => {
+      if (!cancelled) setAssets({ peaks, pps: assetMeta.peaks_per_second, thumbs: [] });
+    }).then((loaded) => {
+      if (cancelled) return;
+      setAssets(loaded);
+      setLoadingAssets(false);
     });
     return () => { cancelled = true; };
-  }, [assetMeta]);
+  }, [assetMeta, assetRetry]);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wrapRef = useRef<HTMLDivElement | null>(null);
@@ -319,19 +342,54 @@ export function Timeline({ projectId }: { projectId: string }) {
       <canvas
         ref={canvasRef}
         className="timeline-canvas"
+        tabIndex={0}
+        aria-label="Timeline. Press Shift F10 for clip actions."
+        onKeyDown={(event) => {
+          if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
+          const { selectedClipId, playhead } = viewStore.state;
+          const clip = clips.find((item) => item.id === selectedClipId) ??
+            clips.find((item) => item.source_in <= playhead && playhead < item.source_out);
+          if (!clip) return;
+          event.preventDefault();
+          const bounds = event.currentTarget.getBoundingClientRect();
+          setSelectedClipId(clip.id);
+          setCtxMenu({
+            x: Math.max(0, Math.min(bounds.left + 12, window.innerWidth - 220)),
+            y: Math.max(0, Math.min(bounds.top + 12, window.innerHeight - 140)),
+            clip,
+            keyboard: true,
+          });
+        }}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
         onContextMenu={onContextMenu}
       />
-      {(assetsGenerating || (assetMeta && !assets)) && (
+      {(assetsGenerating || loadingAssets) && (
         <div className="timeline-generating" role="status">
           <span className="spinner spinner-sm" aria-hidden />
-          generating waveform &amp; thumbnails… the timeline works meanwhile
+          Loading waveform and thumbnails…
         </div>
       )}
+      {!assetsGenerating && !loadingAssets && (
+        (assetsFailed && !assetMeta) || (assets && !assets.peaks?.length &&
+          (project?.media as { source_audio_tracks?: number } | null)?.source_audio_tracks !== 0)
+      ) && (
+        <div className="timeline-generating">
+          <span role="status">{!assetMeta ? "Waveform and thumbnails unavailable" : "Waveform unavailable"}</span>
+          <button className="ghost-btn timeline-asset-retry" disabled={assetsFetching} onClick={() => {
+            void refetchAssets().then((result) => {
+              if (result.isSuccess) setAssetRetry((attempt) => attempt + 1);
+            });
+          }}>
+            {assetsFetching ? "Retrying…" : "Retry"}
+          </button>
+        </div>
+      )}
+      {editError && <div className="timeline-generating" role="alert">{editError}</div>}
       {ctxMenu && (
         <div
+          ref={menuRef}
           className="context-menu"
           style={{ left: ctxMenu.x, top: ctxMenu.y, position: "fixed" }}
           onMouseDown={(e) => e.stopPropagation()}
@@ -343,8 +401,7 @@ export function Timeline({ projectId }: { projectId: string }) {
             <>
               <button
                 onClick={() => {
-                  cutRange.mutate({ project_id: projectId, start: ctxMenu.clip.source_in, end: ctxMenu.clip.source_out });
-                  setCtxMenu(null);
+                  runClipAction(cutRange.mutateAsync({ project_id: projectId, start: ctxMenu.clip.source_in, end: ctxMenu.clip.source_out }));
                 }}
               >
                 Delete this clip
@@ -353,8 +410,7 @@ export function Timeline({ projectId }: { projectId: string }) {
                 viewStore.state.playhead < ctxMenu.clip.source_out && (
                   <button
                     onClick={() => {
-                      splitClip.mutate({ project_id: projectId, clip_id: ctxMenu.clip.id, at_time: viewStore.state.playhead });
-                      setCtxMenu(null);
+                      runClipAction(splitClip.mutateAsync({ project_id: projectId, clip_id: ctxMenu.clip.id, at_time: viewStore.state.playhead }));
                     }}
                   >
                     Split at playhead
@@ -364,8 +420,7 @@ export function Timeline({ projectId }: { projectId: string }) {
           ) : (
             <button
               onClick={() => {
-                restoreRange.mutate({ project_id: projectId, start: ctxMenu.clip.source_in, end: ctxMenu.clip.source_out });
-                setCtxMenu(null);
+                runClipAction(restoreRange.mutateAsync({ project_id: projectId, start: ctxMenu.clip.source_in, end: ctxMenu.clip.source_out }));
               }}
             >
               Restore this cut

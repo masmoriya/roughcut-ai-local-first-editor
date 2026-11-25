@@ -144,7 +144,7 @@ pub fn chunk_text(transcript: &Transcript, chunk: &Chunk) -> Vec<String> {
         .segments
         .iter()
         .flat_map(|&i| transcript.segments[i].words.iter())
-        .flat_map(|w| normalize(&w.text))
+        .flat_map(|w| normalize(w.spoken_text()))
         .collect()
 }
 
@@ -164,7 +164,7 @@ pub fn apply_alignment(transcript: &mut Transcript, chunk: &Chunk, aligned: &[Al
     let mut k = 0;
     for &si in &chunk.segments {
         for (wi, w) in transcript.segments[si].words.iter().enumerate() {
-            let n = normalize(&w.text).len();
+            let n = normalize(w.spoken_text()).len();
             let span = (n > 0).then(|| (aligned[k].start, aligned[k + n - 1].end));
             k += n;
             placed.push((si, wi, span));
@@ -235,6 +235,7 @@ pub fn align_transcript(
         ));
     }
     let dir = aligner_dir();
+    verify_aligner_files(&dir)?;
     let aligner = ForcedAlignerBuilder::new(Wav2Vec2Config {
         model_path: dir.join("model.safetensors").to_string_lossy().into_owned(),
         config_path: dir.join("config.json").to_string_lossy().into_owned(),
@@ -284,6 +285,33 @@ pub fn align_transcript(
     Ok(stats)
 }
 
+pub(crate) fn verify_aligner_files(dir: &std::path::Path) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut buffer = vec![0; 64 * 1024];
+    for &(name, expected, size) in ALIGNER_FILES {
+        let path = dir.join(name);
+        let metadata = path.symlink_metadata()?;
+        if !metadata.is_file() || metadata.len() != size {
+            return Err(CoreError::Unavailable(format!("Invalid word alignment file {name}. Download the model again.")));
+        }
+        let mut file = std::fs::File::open(path)?;
+        let mut digest = Sha256::new();
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        if format!("{:x}", digest.finalize()) != expected {
+            return Err(CoreError::Unavailable(format!("Word alignment file {name} failed verification. Download the model again.")));
+        }
+    }
+    Ok(())
+}
+
 /// Without the `word-align` feature: always unavailable.
 #[cfg(not(feature = "word-align"))]
 pub fn align_transcript(
@@ -296,11 +324,13 @@ pub fn align_transcript(
 }
 
 /// 16 kHz mono f32 samples of a media file's first audio track, via ffmpeg.
-pub async fn read_audio_16k(file_path: &str) -> Result<Vec<f32>> {
+pub async fn read_audio_16k(file_path: &str, stream: Option<usize>) -> Result<Vec<f32>> {
+    let map = stream.map_or_else(|| "0:a:0".to_owned(), |index| format!("0:{index}"));
     let ffmpeg = crate::adapters::video::ffmpeg_path()
         .ok_or_else(|| CoreError::Unavailable("aligning words reads the audio, which needs ffmpeg".into()))?;
     let out = tokio::process::Command::new(ffmpeg)
-        .args(["-v", "error", "-i", file_path, "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000", "-f", "s16le", "pipe:1"])
+        .args(crate::adapters::video::LOCAL_MEDIA_INPUT)
+        .args(["-v", "error", "-i", file_path, "-map", &map, "-vn", "-ac", "1", "-ar", "16000", "-f", "s16le", "pipe:1"])
         .stdin(std::process::Stdio::null())
         .output()
         .await
@@ -321,10 +351,12 @@ mod tests {
     use uuid::Uuid;
 
     fn w(t: &str, a: f64, b: f64) -> Word {
-        Word { text: t.into(), start: a, end: b, confidence: 0.9 }
+        Word { original_text: None, text: t.into(), start: a, end: b, confidence: 0.9 }
     }
     fn seg(words: Vec<Word>) -> TranscriptSegment {
         TranscriptSegment {
+            original_text: None,
+            speaker: None,
             id: Uuid::new_v4(),
             start: words[0].start,
             end: words.last().unwrap().end,
@@ -345,6 +377,8 @@ mod tests {
             model_used: "test".into(),
             words_trimmed: false,
             words_aligned: false,
+            source_fingerprint: None,
+            source_audio_stream_index: None,
         }
     }
     fn aw(t: &str, a: f64, b: f64) -> AlignedWord {

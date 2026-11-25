@@ -16,12 +16,14 @@
 
 import json
 import os
+import stat
 import platform
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.request
+import urllib.parse
 
 POLL_LAUNCH_SECS = 20
 HTTP_TIMEOUT_SECS = 3600  # transcription of long footage is slow; be patient
@@ -55,9 +57,32 @@ def discover_endpoint(launch_if_needed=True):
             "RoughCut does not appear to be running (no endpoint file at %s). "
             "Start the RoughCut app and run this script again." % path
         )
-    with open(path) as f:
-        info = json.load(f)
-    return info["url"], info["token"]
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, encoding="utf-8") as discovery:
+        metadata = os.fstat(discovery.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise RuntimeError("RoughCut discovery must be a private regular file owned by the current user.")
+        content = discovery.read(4097)
+        if len(content) > 4096:
+            raise RuntimeError("RoughCut discovery file is too large.")
+        info = json.loads(content)
+    url = info["url"]
+    endpoint = urllib.parse.urlsplit(url)
+    port = endpoint.port
+    if not port or url != "http://127.0.0.1:%d/mcp" % port:
+        raise RuntimeError("Invalid RoughCut loopback endpoint.")
+    token = info.get("token")
+    if not isinstance(token, str) or len(token) != 40 or not token.isascii() or not token.isalnum():
+        raise RuntimeError("Invalid RoughCut discovery token.")
+    return url, token
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+LOOPBACK_HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
 
 def call_tool(url, token, name, arguments):
@@ -74,7 +99,7 @@ def call_tool(url, token, name, arguments):
         data=body,
         headers={"content-type": "application/json", "authorization": "Bearer " + token},
     )
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECS) as resp:
+    with LOOPBACK_HTTP.open(req, timeout=HTTP_TIMEOUT_SECS) as resp:
         payload = json.load(resp)
     result = payload.get("result", {})
     text = result.get("content", [{}])[0].get("text", "{}")
@@ -140,20 +165,15 @@ def get_resolve():
 
 
 def selected_clip_path(media_pool):
-    """The selected media-pool clip's file path, with sensible fallbacks."""
+    """Return a path only for one explicitly selected media-pool clip."""
     clips = []
     get_selected = getattr(media_pool, "GetSelectedClips", None)
     if callable(get_selected):
         selected = get_selected() or {}
         clips = list(selected.values()) if isinstance(selected, dict) else list(selected)
-    if not clips:
-        root = media_pool.GetRootFolder()
-        clips = list(root.GetClipList() or [])
-    for clip in clips:
-        path = clip.GetClipProperty("File Path")
-        if path:
-            return path
-    return None
+    if len(clips) != 1:
+        return None
+    return clips[0].GetClipProperty("File Path") or None
 
 
 def run_in_resolve(resolve):

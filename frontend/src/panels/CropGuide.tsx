@@ -11,7 +11,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useStore } from "@tanstack/react-store";
 import {
-  useCenterClipOnFace,
   useClipCandidates,
   useClips,
   useFrameCandidate,
@@ -195,7 +194,6 @@ export function CropGuide({ projectId, frameW, frameH }: { projectId: string; fr
   const { data: clips } = useClips(projectId);
   const clip = clips?.find((c) => c.id === cropClipId && c.format === "vertical");
   const update = useUpdateClip();
-  const face = useCenterClipOnFace();
   const [note, setNote] = useState<string | null>(null);
 
   // The clip was deleted or switched to 16:9: stop framing it.
@@ -219,21 +217,6 @@ export function CropGuide({ projectId, frameW, frameH }: { projectId: string; fr
       },
     );
   };
-  const findFace = () => {
-    setNote(null);
-    face.mutate(
-      { project_id: projectId, clip_id: clip.id },
-      {
-        onSuccess: (r) =>
-          setNote(
-            r.crop_x === null
-              ? `no clear face in ${r.frames_sampled} frames · drag to frame it`
-              : `framed on the speaker · face in ${r.frames_with_face}/${r.frames_sampled} frames`,
-          ),
-        onError: (e) => setNote(errText(e)),
-      },
-    );
-  };
 
   return (
     <CropFrame
@@ -245,18 +228,13 @@ export function CropGuide({ projectId, frameW, frameH }: { projectId: string; fr
         <>
           <span className="crop-title">{clip.title}</span>
           <span className="crop-note">
-            {face.isPending
-              ? "finding the speaker…"
-              : (note ?? zoomNote(frameH, framing) ?? "drag to move · drag a corner to zoom")}
+            {note ?? zoomNote(frameH, framing) ?? "drag to move · drag a corner to zoom"}
           </span>
           {framing.crop_zoom > 1.005 && (
             <button className="crop-btn" onClick={() => commit({ ...framing, crop_zoom: 1, crop_y: 0.5 })} title="Back to the full frame height">
               full height
             </button>
           )}
-          <button className="crop-btn" onClick={findFace} disabled={face.isPending} title="Centre the crop on the speaker's face">
-            ◎ face
-          </button>
           <button className="crop-btn" onClick={() => setCropClip(null)}>
             done
           </button>

@@ -4,9 +4,9 @@
   "version": "0.2.0",
   "identifier": "dev.localfirst.roughcut",
   "build": {
-    "beforeDevCommand": "cd ../frontend 2>/dev/null || cd ../../frontend; npm run dev",
-    "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "cd ../frontend 2>/dev/null || cd ../../frontend; npm run build",
+    "beforeDevCommand": "{ cd '../frontend' 2>/dev/null || cd '../../frontend'; } && npm run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "{ cd '../frontend' 2>/dev/null || cd '../../frontend'; } && npm run build",
     "frontendDist": "../../frontend/dist"
   },
   "app": {
@@ -22,14 +22,10 @@
       }
     ],
     "security": {
-      "csp": null,
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: rcmedia: http://rcmedia.localhost https://rcmedia.localhost; media-src 'self' blob: rcmedia: http://rcmedia.localhost https://rcmedia.localhost; connect-src 'self' ipc: http://ipc.localhost https://ipc.localhost rcmedia: http://rcmedia.localhost https://rcmedia.localhost; object-src 'none'; base-uri 'none'; frame-src 'none'; form-action 'none'",
+      "devCsp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: rcmedia: http://rcmedia.localhost https://rcmedia.localhost; media-src 'self' blob: rcmedia: http://rcmedia.localhost https://rcmedia.localhost; connect-src 'self' ws://127.0.0.1:1420 ipc: http://ipc.localhost https://ipc.localhost rcmedia: http://rcmedia.localhost https://rcmedia.localhost; object-src 'none'; base-uri 'none'; frame-src 'none'; form-action 'none'",
       "assetProtocol": {
-        "enable": true,
-        "scope": [
-          "**",
-          "/**",
-          "$HOME/**"
-        ]
+        "enable": false
       }
     }
   },

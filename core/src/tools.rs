@@ -12,7 +12,7 @@ use crate::detect;
 use crate::engine::Editor;
 use crate::error::{CoreError, Result};
 use crate::export;
-use crate::model::{ActionSource, Aggressiveness, EditOp};
+use crate::model::{ActionSource, Aggressiveness, EditAction, EditOp, SourceRange};
 use serde_json::{json, Value};
 use std::future::Future;
 use std::pin::Pin;
@@ -88,8 +88,19 @@ impl Caller {
     fn can_use(self, spec: &ToolSpec) -> bool {
         match self {
             Caller::Ui => true,
-            Caller::Mcp => !spec.meta,
-            Caller::Agent { .. } => spec.agent && !spec.meta,
+            Caller::Mcp => !spec.meta && !matches!(spec.name,
+                "import_timed_transcript" | "correct_transcript_segment" | "review_search_cuts"
+                | "protect_source_ranges" | "highlight_source_ranges" | "get_history_cut_review"
+            ),
+            Caller::Agent { attribute_to } => spec.agent && match spec.name {
+                "detect_silences" | "get_suggestions" | "get_cut_proposal"
+                | "find_segments" | "read_transcript" | "get_timeline" => true,
+                "remove_silences" | "generate_rough_cut" | "cut_range" | "cut_passage"
+                | "cut_by_transcript" | "story_edit" | "plan_duration_cut" => {
+                    attribute_to == ActionSource::LocalAi
+                }
+                _ => false,
+            },
         }
     }
 
@@ -315,6 +326,22 @@ fn edit(editor: &Editor, project_id: Uuid, op: EditOp, source: ActionSource) -> 
     Ok(json!({ "action": outcome.action, "timeline": outcome.timeline }))
 }
 
+fn history_action_summary(mut action: Option<EditAction>) -> Option<EditAction> {
+    if let Some(action) = &mut action {
+        // Detailed review receipts are fetched through desktop-only history.
+        action.cut_review = None;
+    }
+    action
+}
+
+fn edit_selection(editor: &Editor, args: &Value, project_id: Uuid, op: EditOp, source: ActionSource) -> Result<Value> {
+    let Some(transcript_id) = arg_uuid_opt(args, "transcript_id")? else {
+        return edit(editor, project_id, op, source);
+    };
+    let outcome = editor.commit_edit(project_id, op, source, None, None, Some(transcript_id))?;
+    Ok(json!({ "action": outcome.action, "timeline": outcome.timeline }))
+}
+
 /// The in-app chat's cuts are proposed, not made: the user reviews and
 /// applies them (`apply_cut_proposal`). UI clicks and MCP clients cut at once.
 fn proposes(source: ActionSource) -> bool {
@@ -400,14 +427,196 @@ handler!(h_retime_words, |e, a, _s| {
     Ok(serde_json::to_value(e.retime_words(arg_uuid(a, "project_id")?).await?)?)
 });
 
+handler!(h_correct_transcript_segment, |e, a, s| {
+    if s != ActionSource::Ui {
+        return Err(CoreError::Unavailable("Transcript corrections are available in the editor".into()));
+    }
+    e.correct_transcript_segment(
+        arg_uuid(a, "project_id")?, arg_uuid(a, "segment_id")?,
+        arg_str(a, "original")?, arg_str(a, "original_speaker")?,
+        arg_str(a, "text")?, a["speaker"].as_str(),
+    )?;
+    Ok(json!({ "saved": true }))
+});
+
+handler!(h_import_timed_transcript, |e, a, _s| {
+    let text = arg_str(a, "text")?;
+    if text.len() > 16 * 1024 * 1024 {
+        return Err(CoreError::InvalidArg("Choose a transcript file no larger than 16 MiB".into()));
+    }
+    #[derive(serde::Deserialize)]
+    struct TimedTranscriptFile {
+        schema_version: u32,
+        transcript: crate::model::Transcript,
+    }
+    let project_id = arg_uuid(a, "project_id")?;
+    let format = match a.get("format") {
+        None => "json",
+        Some(value) => value.as_str().ok_or_else(|| CoreError::InvalidArg("Choose timed JSON or SRT captions".into()))?,
+    };
+    let document: Value = match format {
+        "srt" => crate::engine::parse_srt_transcript(text)?,
+        "json" => serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(text))?,
+        _ => return Err(CoreError::InvalidArg("Choose timed JSON or SRT captions".into())),
+    };
+    let external = document.get("schema_version").is_none() && document.get("segments").is_some();
+    if external && document.get("mapping").is_some_and(|mapping| {
+        !mapping.is_null() && !mapping.as_array().is_some_and(Vec::is_empty)
+    }) {
+        return Err(CoreError::InvalidArg(
+            "This transcript includes a time mapping. Convert its timestamps to the attached media's clock before importing.".into(),
+        ));
+    }
+    let expected_fps = document.get(if external { "fps" } else { "source_frame_rate" })
+        .map(|value| value.as_f64().ok_or_else(|| CoreError::InvalidArg("Transcript frame rate must be numeric".into())))
+        .transpose()?;
+    let expected_duration = document.get("source_duration_seconds")
+        .map(|value| value.as_f64().ok_or_else(|| CoreError::InvalidArg("Transcript source duration must be numeric".into())))
+        .transpose()?;
+    let mut transcript = if external {
+        if a["confirm_source_clock"].as_bool() != Some(true) {
+            return Err(CoreError::InvalidArg("Confirm that the transcript timestamps match the attached source".into()));
+        }
+        crate::engine::parse_external_transcript(document)?
+    } else {
+        let file: TimedTranscriptFile = serde_json::from_value(document)?;
+        if file.schema_version != 1 {
+            return Err(CoreError::InvalidArg("Unsupported transcript JSON version".into()));
+        }
+        file.transcript
+    };
+    if format == "srt" {
+        transcript.model_used = "Imported SRT captions".into();
+    }
+    if transcript.source_audio_stream_index.is_none() && a["confirm_source_clock"].as_bool() == Some(true) {
+        if let Some(stream) = a.get("audio_stream_index") {
+            transcript.source_audio_stream_index = Some(stream.as_u64()
+                .and_then(|index| usize::try_from(index).ok())
+                .ok_or_else(|| CoreError::InvalidArg("Invalid dialogue track".into()))?);
+        }
+    }
+    let confirmed_source = if transcript.source_fingerprint.is_none()
+        && a["confirm_source_clock"].as_bool() == Some(true)
+    {
+        Some((arg_str(a, "confirmed_source_path")?, arg_uuid(a, "confirmed_media_id")?))
+    } else {
+        None
+    };
+    e.import_timed_transcript(project_id, transcript, confirmed_source, expected_fps, expected_duration, text.as_bytes())?;
+    Ok(json!({"imported": true}))
+});
+
+handler!(h_review_search_cuts, |e, a, s| {
+    use sha2::{Digest, Sha256};
+    let project_id = arg_uuid(a, "project_id")?;
+    let ranges = a["ranges"].as_array().ok_or_else(|| CoreError::InvalidArg("Expected cut ranges".into()))?;
+    if ranges.is_empty() || ranges.len() > 10_000 {
+        return Err(CoreError::InvalidArg("Choose between 1 and 10,000 timed matches".into()));
+    }
+    let ops = ranges.iter().map(|range| {
+        let start = range["start"].as_f64().ok_or_else(|| CoreError::InvalidArg("Missing cut start".into()))?;
+        let end = range["end"].as_f64().ok_or_else(|| CoreError::InvalidArg("Missing cut end".into()))?;
+        if !start.is_finite() || !end.is_finite() || start < 0.0 || end <= start {
+            return Err(CoreError::InvalidArg("Invalid cut range".into()));
+        }
+        Ok(EditOp::CutRange { start, end })
+    }).collect::<Result<Vec<_>>>()?;
+    let category = a["category"].as_str().unwrap_or("search");
+    let title = match category {
+        "fillers" => "Filler matches",
+        "profanity" => "Profanity list matches",
+        "keywords" => "Keyword list matches",
+        "search" => "Search matches",
+        _ => return Err(CoreError::InvalidArg("Unknown search category".into())),
+    };
+    let expected_transcript = arg_uuid(a, "transcript_id")?;
+    let fps = e.with_project(project_id, |project, _| Ok(project.fps()))?;
+    let mut matches = Vec::with_capacity(ranges.len());
+    let mut rule_ids = std::collections::HashMap::new();
+    let mut match_frames = std::collections::HashMap::new();
+    for (range, op) in ranges.iter().zip(&ops) {
+        let EditOp::CutRange { start, end } = op else { continue };
+        let occurrence = arg_str(range, "occurrenceKey")?;
+        let rule = arg_str(range, "ruleKey")?;
+        if occurrence.is_empty() || occurrence.len() > 160 || rule.is_empty() || rule.len() > 4096 {
+            return Err(CoreError::InvalidArg("Invalid phrase match identity".into()));
+        }
+        let rule_id = match rule_ids.entry(rule) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(format!("{:x}", Sha256::digest(serde_json::to_vec(&(category, rule))?)))
+            }
+        };
+        let match_id = format!("{:x}", Sha256::digest(serde_json::to_vec(&(expected_transcript, rule_id.as_str(), occurrence))?));
+        let frames = (crate::time::to_frame(*start, fps), crate::time::to_frame(*end, fps));
+        if let Some(previous) = match_frames.insert(match_id.clone(), frames) {
+            if previous != frames {
+                return Err(CoreError::InvalidArg("A phrase match has conflicting source frames".into()));
+            }
+            continue;
+        }
+        matches.push(crate::model::PhraseMatchIdentity {
+            rule_id: rule_id.clone(), match_id,
+            source_in_frame: frames.0,
+            source_out_frame: frames.1,
+            word_ids: Vec::new(),
+            min_word_confidence: None,
+            context_before: String::new(),
+            context_after: String::new(),
+        });
+    }
+    matches.sort_unstable_by_key(|m| m.source_in_frame);
+    let out = e.propose_labeled_ops(project_id, ops, (title, Some(category), Some(expected_transcript)), &matches, s, None, false)?;
+    Ok(proposal_receipt(e, project_id, &out.added, out.proposal.as_ref()))
+});
+
+handler!(h_protect_source_ranges, |e, a, _s| {
+    let ranges: Vec<SourceRange> = serde_json::from_value(a["ranges"].clone())?;
+    if ranges.len() > 1_000 {
+        return Err(CoreError::InvalidArg("Choose at most 1,000 ranges at a time".into()));
+    }
+    let split_cut = a.get("split_cut_id").map(|value| value.as_u64().and_then(|id| u32::try_from(id).ok())
+        .ok_or_else(|| CoreError::InvalidArg("Invalid cut ID".into()))).transpose()?;
+    Ok(json!({ "protected": e.update_source_annotation(arg_uuid(a, "project_id")?, ranges, a["remove"].as_bool().unwrap_or(false), false, arg_uuid_opt(a, "transcript_id")?, arg_uuid_opt(a, "proposal_id")?, split_cut)? }))
+});
+
+handler!(h_highlight_source_ranges, |e, a, s| {
+    if s != ActionSource::Ui {
+        return Err(CoreError::Unavailable("Highlights are available in the editor".into()));
+    }
+    let ranges: Vec<SourceRange> = serde_json::from_value(a["ranges"].clone())?;
+    if !(1..=1_000).contains(&ranges.len()) {
+        return Err(CoreError::InvalidArg("Choose between 1 and 1,000 ranges to highlight".into()));
+    }
+    Ok(json!({ "highlighted": e.update_source_annotation(arg_uuid(a, "project_id")?, ranges, a["remove"].as_bool().unwrap_or(false), true, arg_uuid_opt(a, "transcript_id")?, None, None)? }))
+});
+
 handler!(h_import_media, |e, a, _s| {
-    let media = e.import_media(arg_uuid_opt(a, "project_id")?, arg_str(a, "file_path")?).await?;
-    Ok(serde_json::to_value(media)?)
+    let project_id = arg_uuid_opt(a, "project_id")?;
+    let media = e.import_media(project_id, arg_str(a, "file_path")?).await?;
+    let mut response = serde_json::to_value(&media)?;
+    if let Some(project_id) = project_id {
+        response["media_fingerprint"] = e.with_project(project_id, |project, _| {
+            let fingerprint = project.media.as_ref()
+                .filter(|current| current.id == media.id && current.file_path == media.file_path)
+                .and(project.media_fingerprint.as_deref());
+            Ok(json!(fingerprint))
+        })?;
+    }
+    Ok(response)
 });
 
 handler!(h_transcribe, |e, a, _s| {
-    let t = e.transcribe(arg_uuid(a, "project_id")?, a["language"].as_str()).await?;
+    let stream = a.get("audio_stream_index").map(|value| {
+        value.as_u64().and_then(|index| usize::try_from(index).ok())
+            .ok_or_else(|| CoreError::InvalidArg("Audio stream index must be a non-negative integer".into()))
+    }).transpose()?;
+    let t = e.transcribe_audio_stream(arg_uuid(a, "project_id")?, a["language"].as_str(), stream).await?;
     Ok(serde_json::to_value(t)?)
+});
+
+handler!(h_cancel_transcription, |e, a, _s| {
+    Ok(json!({ "cancelled": e.cancel_transcription(arg_uuid(a, "project_id")?) }))
 });
 
 handler!(h_detect_silences, |e, a, _s| {
@@ -438,7 +647,7 @@ handler!(h_remove_silences, |e, a, s| {
     // helper. Touches no words, fillers, takes, or order — the whole point
     // versus generate_rough_cut.
     let project_id = arg_uuid(a, "project_id")?;
-    if proposes(s) {
+    if proposes(s) || a["review"].as_bool() == Some(true) {
         let ops = e
             .confirmed_silences(project_id)
             .await?
@@ -488,6 +697,8 @@ handler!(h_generate_rough_cut, |e, a, s| {
         "nothing to cut: no pauses or filler words found"
     } else if report.applied {
         "cut (one undoable edit)"
+    } else if s == ActionSource::Ui {
+        "Review the proposed cuts and press Apply to update the timeline."
     } else {
         "NOT cut yet: proposed. The cuts are marked in the transcript and timeline for the user \
          to review and play; they press Apply, or say \"apply\" and you call apply_cut_proposal."
@@ -506,6 +717,8 @@ handler!(h_get_cut_proposal, |e, a, _s| {
             );
             json!({
                 "proposal": {
+                    "id": p.id,
+                    "transcript_id": p.transcript_id,
                     "title": p.title,
                     "created_at": p.created_at,
                     "total": p.cuts.len(),
@@ -521,9 +734,15 @@ handler!(h_get_cut_proposal, |e, a, _s| {
 
 handler!(h_apply_cut_proposal, |e, a, s| {
     let pid = arg_uuid(a, "project_id")?;
-    let out = e.apply_cut_proposal(pid, s)?;
+    let out = if a.get("proposal_id").is_some() || !e.inference_enabled() {
+        let id = arg_uuid(a, "proposal_id")?;
+        let selected: Vec<u32> = serde_json::from_value(a["selected_cut_ids"].clone())?;
+        e.apply_reviewed_cut_proposal(pid, s, Some((id, &selected)))?
+    } else {
+        e.apply_cut_proposal(pid, s)?
+    };
     Ok(json!({
-        "action": out.action,
+        "action": history_action_summary(out.action),
         "applied": out.applied,
         "skipped": out.skipped,
         "seconds": (out.seconds * 10.0).round() / 10.0,
@@ -533,7 +752,11 @@ handler!(h_apply_cut_proposal, |e, a, s| {
 });
 
 handler!(h_discard_cut_proposal, |e, a, _s| {
-    Ok(json!({ "discarded": e.discard_cut_proposal(arg_uuid(a, "project_id")?)? }))
+    let project_id = arg_uuid(a, "project_id")?;
+    let expected = if a.get("proposal_id").is_some() || !e.inference_enabled() {
+        Some(arg_uuid(a, "proposal_id")?)
+    } else { None };
+    Ok(json!({ "discarded": e.discard_reviewed_cut_proposal(project_id, expected)? }))
 });
 
 handler!(h_skip_proposed_cuts, |e, a, _s| {
@@ -551,7 +774,10 @@ handler!(h_skip_proposed_cuts, |e, a, _s| {
         v => return Err(CoreError::InvalidArg(format!("'cut_ids' must be an array, got {}", json_kind(v)))),
     };
     let skip = a["skip"].as_bool().unwrap_or(true);
-    let (p, changed) = e.skip_proposed_cuts(pid, ids.as_deref(), a["kind"].as_str(), skip)?;
+    let expected = if a.get("proposal_id").is_some() || !e.inference_enabled() {
+        Some(arg_uuid(a, "proposal_id")?)
+    } else { None };
+    let (p, changed) = e.skip_proposed_cuts(pid, expected, ids.as_deref(), a["kind"].as_str(), skip)?;
     let left: Vec<_> = p.cuts.iter().filter(|c| !c.skipped).collect();
     Ok(json!({
         "changed": changed,
@@ -566,6 +792,11 @@ handler!(h_get_suggestions, |e, a, _s| {
 });
 
 handler!(h_accept_suggestion, |e, a, s| {
+    if !e.inference_enabled() {
+        let project_id = arg_uuid(a, "project_id")?;
+        let out = e.review_saved_suggestions(project_id, Some(arg_uuid(a, "suggestion_id")?))?;
+        return Ok(proposal_receipt(e, project_id, &out.added, out.proposal.as_ref()));
+    }
     let action = e.accept_suggestion(
         arg_uuid(a, "project_id")?,
         arg_uuid(a, "suggestion_id")?,
@@ -575,6 +806,11 @@ handler!(h_accept_suggestion, |e, a, s| {
 });
 
 handler!(h_accept_all_suggestions, |e, a, s| {
+    if !e.inference_enabled() {
+        let project_id = arg_uuid(a, "project_id")?;
+        let out = e.review_saved_suggestions(project_id, None)?;
+        return Ok(proposal_receipt(e, project_id, &out.added, out.proposal.as_ref()));
+    }
     let (action, accepted) = e.accept_all_suggestions(arg_uuid(a, "project_id")?, s)?;
     Ok(json!({ "action": action, "accepted": accepted }))
 });
@@ -596,7 +832,7 @@ handler!(h_cut_range, |e, a, s| {
     if proposes(s) {
         return propose(e, pid, vec![EditOp::CutRange { start, end }], "Chat", s);
     }
-    edit(e, pid, EditOp::CutRange { start, end }, s)
+    edit_selection(e, a, pid, EditOp::CutRange { start, end }, s)
 });
 
 handler!(h_cut_passage, |e, a, s| {
@@ -656,7 +892,7 @@ handler!(h_restore_range, |e, a, s| {
     if proposes(s) {
         return restore_for_chat(e, pid, &[(start, end)], op, s);
     }
-    edit(e, pid, op, s)
+    edit_selection(e, a, pid, op, s)
 });
 
 handler!(h_cut_by_transcript, |e, a, s| {
@@ -665,7 +901,7 @@ handler!(h_cut_by_transcript, |e, a, s| {
     if proposes(s) {
         return propose(e, pid, vec![op], "Chat", s);
     }
-    edit(e, pid, op, s)
+    edit_selection(e, a, pid, op, s)
 });
 
 handler!(h_restore_by_transcript, |e, a, s| {
@@ -678,7 +914,7 @@ handler!(h_restore_by_transcript, |e, a, s| {
         })?;
         return restore_for_chat(e, pid, &ranges, EditOp::RestoreSegments { segment_ids: ids }, s);
     }
-    edit(e, pid, EditOp::RestoreSegments { segment_ids: ids }, s)
+    edit_selection(e, a, pid, EditOp::RestoreSegments { segment_ids: ids }, s)
 });
 
 handler!(h_trim_clip, |e, a, s| {
@@ -752,8 +988,12 @@ handler!(h_read_transcript, |e, a, _s| {
 });
 
 handler!(h_attach_screen_media, |e, a, _s| {
-    e.attach_screen_media(arg_uuid(a, "project_id")?, arg_str(a, "file_path")?).await?;
-    Ok(serde_json::json!({ "attached": true }))
+    let project_id = arg_uuid(a, "project_id")?;
+    e.attach_screen_media(project_id, arg_str(a, "file_path")?).await?;
+    e.with_project(project_id, |project, _| {
+        Ok(json!({ "attached": true, "screen_media": &project.screen_media,
+            "screen_media_fingerprint": &project.screen_media_fingerprint }))
+    })
 });
 
 handler!(h_set_layout, |e, a, _s| {
@@ -792,8 +1032,15 @@ handler!(h_set_audio_offset, |e, a, _s| {
 });
 
 handler!(h_append_media, |e, a, _s| {
-    let media = e.append_media(arg_uuid(a, "project_id")?, arg_str(a, "file_path")?).await?;
-    Ok(serde_json::json!({ "media": media, "note": "re-run transcribe to caption the appended span; existing cuts kept their timestamps" }))
+    let project_id = arg_uuid(a, "project_id")?;
+    let media = e.append_media(project_id, arg_str(a, "file_path")?).await?;
+    e.with_project(project_id, |project, _| {
+        let fingerprint = project.media.as_ref()
+            .filter(|current| current.id == media.id && current.file_path == media.file_path)
+            .and(project.media_fingerprint.as_deref());
+        Ok(json!({ "media": media, "media_fingerprint": fingerprint,
+            "note": "Existing cuts kept their timestamps" }))
+    })
 });
 
 handler!(h_outline_transcript, |e, a, _s| {
@@ -1106,8 +1353,8 @@ handler!(h_export, |e, a, s| {
             "export denied: the user did not approve this externally-requested write".into(),
         ));
     }
-    let path = e.export(arg_uuid(a, "project_id")?, &target, &out_path).await?;
-    Ok(json!({ "path": path }))
+    let receipt = e.export_with_receipt(arg_uuid(a, "project_id")?, &target, &out_path).await?;
+    Ok(serde_json::to_value(receipt)?)
 });
 
 handler!(h_find_clips, |e, a, _s| {
@@ -1166,8 +1413,7 @@ fn arg_clip_format(args: &Value) -> Result<Option<crate::model::ClipFormat>> {
 
 /// Clip pieces from `ranges` ([{start, end}]), `segment_ids` (whole
 /// sentences), or a single `start`+`end` — whichever the caller sent.
-fn arg_clip_ranges(e: &Editor, project_id: Uuid, args: &Value) -> Result<Option<Vec<crate::model::SourceRange>>> {
-    use crate::model::SourceRange;
+fn arg_clip_ranges(e: &Editor, project_id: Uuid, args: &Value) -> Result<Option<Vec<SourceRange>>> {
     if let Some(arr) = args["ranges"].as_array() {
         return arr
             .iter()
@@ -1417,16 +1663,24 @@ handler!(h_undo_actions, |e, a, _s| {
 
 handler!(h_undo, |e, a, _s| {
     let (action, timeline) = e.undo(arg_uuid(a, "project_id")?)?;
-    Ok(json!({ "action": action, "timeline": timeline }))
+    Ok(json!({ "action": history_action_summary(action), "timeline": timeline }))
 });
 
 handler!(h_redo, |e, a, _s| {
     let (action, timeline) = e.redo(arg_uuid(a, "project_id")?)?;
-    Ok(json!({ "action": action, "timeline": timeline }))
+    Ok(json!({ "action": history_action_summary(action), "timeline": timeline }))
 });
 
 handler!(h_get_history, |e, a, _s| {
     Ok(serde_json::to_value(e.history(arg_uuid(a, "project_id")?)?)?)
+});
+
+handler!(h_get_history_cut_review, |e, a, _s| {
+    let offset = a.get("offset").map(|value| {
+        value.as_u64().and_then(|offset| usize::try_from(offset).ok())
+            .ok_or_else(|| CoreError::InvalidArg("Review offset must be a non-negative integer".into()))
+    }).transpose()?.unwrap_or(0);
+    Ok(e.history_cut_review(arg_uuid(a, "project_id")?, arg_uuid(a, "action_id")?, offset)?.unwrap_or(Value::Null))
 });
 
 handler!(h_create_checkpoint, |e, a, _s| {
@@ -1458,7 +1712,9 @@ handler!(h_jump_to, |e, a, _s| {
 handler!(h_get_preferences, |e, _a, _s| Ok(serde_json::to_value(e.get_preferences()?)?));
 
 handler!(h_set_preferences, |e, a, s| {
-    Ok(serde_json::to_value(e.update_preferences(&a["preferences"], s)?)?)
+    Ok(serde_json::to_value(e.update_preferences_checked(
+        &a["preferences"], s, a.get("expected_rule_sets"),
+    )?)?)
 });
 
 // ---------------------------------------------------------- the registry
@@ -1481,20 +1737,44 @@ macro_rules! tool {
 }
 
 static REGISTRY: &[ToolSpec] = &[
+    tool!("highlight_source_ranges", "Mark source passages without editing the timeline.",
+        || obj(json!({"project_id": pid_schema(), "transcript_id": {"type": "string"}, "ranges": {"type": "array", "items": {"type": "object"}}, "remove": {"type": "boolean"}}), &["project_id", "ranges"]),
+        agent: false, meta: false, h_highlight_source_ranges),
+    tool!("import_timed_transcript", "Import an exported timed transcript for the same source media.",
+        || obj(json!({"project_id": pid_schema(), "text": {"type": "string"}, "format": {"enum": ["json", "srt"]}, "confirm_source_clock": {"type": "boolean"}, "confirmed_source_path": {"type": "string"}, "confirmed_media_id": pid_schema(), "audio_stream_index": {"type": "integer", "minimum": 0}}), &["project_id", "text"]),
+        agent: false, meta: false, h_import_timed_transcript),
+    tool!("protect_source_ranges", "Protect source ranges from automatic cut proposals. An empty list clears protection.",
+        || obj(json!({"project_id": pid_schema(), "transcript_id": {"type": "string"}, "proposal_id": {"type": "string"}, "split_cut_id": {"type": "integer", "minimum": 1}, "ranges": {"type": "array", "items": {"type": "object"}}, "remove": {"type": "boolean"}}), &["project_id", "ranges"]),
+        agent: false, meta: false, h_protect_source_ranges),
+    tool!("cancel_transcription", "Cancel the active transcription for this project.",
+        || obj(json!({"project_id": pid_schema()}), &["project_id"]),
+        agent: false, meta: false, h_cancel_transcription),
+    tool!("review_search_cuts", "Prepare timed search matches for manual cut review.",
+        || obj(json!({"project_id": pid_schema(), "transcript_id": {"type": "string"},
+            "ranges": {"type": "array", "minItems": 1, "maxItems": 10000, "items": {
+                "type": "object", "required": ["start", "end", "occurrenceKey", "ruleKey"],
+                "properties": {"start": {"type": "number", "minimum": 0}, "end": {"type": "number"},
+                    "occurrenceKey": {"type": "string", "minLength": 1, "maxLength": 160},
+                    "ruleKey": {"type": "string", "minLength": 1, "maxLength": 4096}}
+            }}, "category": {"type": "string", "enum": ["search", "fillers", "profanity", "keywords"]}}), &["project_id", "transcript_id", "ranges"]),
+        agent: false, meta: false, h_review_search_cuts),
+    tool!("correct_transcript_segment", "Correct a speech segment without changing word timings.",
+        || obj(json!({"project_id": pid_schema(), "segment_id": {"type": "string"}, "original": {"type": "string"}, "original_speaker": {"type": "string"}, "text": {"type": "string"}, "speaker": {"type": "string"}}), &["project_id", "segment_id", "original", "original_speaker", "text"]),
+        agent: false, meta: false, h_correct_transcript_segment),
     tool!("import_media", "Probe a local video file and return its metadata. With project_id, attach it to that project: a project with no media gets it (and a fresh timeline); a project whose video was moved can be relinked to the same video at a new path (same duration, size, frame rate — cuts, history, and transcript are kept). A different video is refused: create a new project, or use append_media.",
         || obj(json!({"project_id": pid_schema(), "file_path": {"type": "string"}}), &["file_path"]),
         agent: false, meta: false, h_import_media),
     tool!("retime_words", "Fix word timings on an existing transcript: lines every word up with the audio using the local word alignment model (English; download it in Setup), then trims each word to its sound. Whisper only estimates word times, so word-level cuts and snaps can land in the wrong place. Changes no text and no cuts. New transcriptions already do this. Returns { aligned, chunks, chunks_kept, words, trimmed, seconds_removed, relocated, note? } (note says why alignment didn't run).",
         || obj(json!({"project_id": pid_schema()}), &["project_id"]),
         agent: false, meta: false, h_retime_words),
-    tool!("transcribe", "Transcribe the project's media on-device into time-aligned text. Afterwards the app polishes punctuation with its model in the background (on-device, or on Claude when the user has switched the app to Hosted).",
-        || obj(json!({"project_id": pid_schema(), "language": {"type": "string"}}), &["project_id"]),
+    tool!("transcribe", "Transcribe the project's media on-device into time-aligned text.",
+        || obj(json!({"project_id": pid_schema(), "language": {"type": "string"}, "audio_stream_index": {"type": "integer", "minimum": 0}}), &["project_id"]),
         agent: false, meta: false, h_transcribe),
     tool!("detect_silences", "PREVIEW dead-air ranges (read-only): word-gap candidates confirmed and boundary-snapped against actual audio energy (per-file adaptive thresholds). Each range carries source: confirmed | transcript_only. To actually remove them, use remove_silences.",
         || obj(json!({"project_id": pid_schema(), "min_duration_s": {"type": "number"}}), &["project_id"]),
         agent: true, meta: false, h_detect_silences),
     tool!("remove_silences", "Remove ONLY dead air: deletes non-speech gaps confirmed by the actual audio waveform (from the in-app chat: proposes them instead — see get_cut_proposal). Changes NOTHING about the words, their order, or which topics are kept — never touches fillers or takes. This is the silence-only tool; for filler/take removal use generate_rough_cut, for narrative restructuring use story_edit.",
-        || obj(json!({"project_id": pid_schema(), "min_duration_s": {"type": "number"}}), &["project_id"]),
+        || obj(json!({"project_id": pid_schema(), "min_duration_s": {"type": "number"}, "review": {"type": "boolean"}}), &["project_id"]),
         agent: true, meta: false, mutating: true, h_remove_silences),
     tool!("detect_fillers", "Flag filler words (um, uh, ...) in the transcript. Persists the flags.",
         || obj(json!({"project_id": pid_schema()}), &["project_id"]),
@@ -1521,28 +1801,28 @@ static REGISTRY: &[ToolSpec] = &[
         || obj(json!({"project_id": pid_schema(), "limit": {"type": "integer", "description": "max cuts listed, default 200"}}), &["project_id"]),
         agent: true, meta: false, h_get_cut_proposal),
     tool!("apply_cut_proposal", "Make the proposed cuts that aren't skipped, as ONE undoable edit (an automatic checkpoint is taken first), and clear the proposal. Call this when the user says to apply / go ahead / yes to proposed cuts. Returns { action, applied, skipped, seconds, cut_count, included_duration_s }.",
-        || obj(json!({"project_id": pid_schema()}), &["project_id"]),
+        || obj(json!({"project_id": pid_schema(), "proposal_id": pid_schema(), "selected_cut_ids": {"type": "array", "items": {"type": "integer"}}}), &["project_id"]),
         agent: true, meta: false, mutating: true, h_apply_cut_proposal),
     tool!("discard_cut_proposal", "Drop the proposed cuts without cutting anything (the user said never mind / don't cut). Returns { discarded } (false when nothing was proposed).",
-        || obj(json!({"project_id": pid_schema()}), &["project_id"]),
+        || obj(json!({"project_id": pid_schema(), "proposal_id": pid_schema()}), &["project_id"]),
         agent: true, meta: false, h_discard_cut_proposal),
     tool!("skip_proposed_cuts", "Leave proposed cuts out (skip=true, the default) or put them back (skip=false) before applying: by cut_ids (the numbers from get_cut_proposal), by kind (pause | filler | words — e.g. 'keep the pauses' = kind pause), both, or with neither every cut. Returns { changed, to_apply, skipped, seconds_to_apply }.",
-        || obj(json!({"project_id": pid_schema(), "cut_ids": {"type": "array", "items": {"type": "integer"}}, "kind": {"type": "string", "enum": ["pause", "filler", "words"]}, "skip": {"type": "boolean", "description": "true leaves them out (default), false puts them back"}}), &["project_id"]),
+        || obj(json!({"project_id": pid_schema(), "proposal_id": pid_schema(), "cut_ids": {"type": "array", "items": {"type": "integer"}}, "kind": {"type": "string", "enum": ["pause", "filler", "words"]}, "skip": {"type": "boolean", "description": "true leaves them out (default), false puts them back"}}), &["project_id"]),
         agent: true, meta: false, h_skip_proposed_cuts),
     tool!("cut_range", "Exclude a source time range [start, end] (seconds) from the cut. Non-destructive. Pass snap=\"word\" or \"sentence\" to land the cut on clean word/sentence boundaries using the transcript's word timings, so it never clips mid-word — use this instead of parsing word timestamps yourself. From the in-app chat this PROPOSES instead (nothing is cut until apply_cut_proposal).",
-        || obj(json!({"project_id": pid_schema(), "start": {"type": "number"}, "end": {"type": "number"}, "snap": {"type": "string", "enum": ["none", "word", "sentence"], "description": "snap the cut to clean boundaries (default none)"}}), &["project_id", "start", "end"]),
+        || obj(json!({"project_id": pid_schema(), "transcript_id": {"type": "string"}, "start": {"type": "number"}, "end": {"type": "number"}, "snap": {"type": "string", "enum": ["none", "word", "sentence"], "description": "snap the cut to clean boundaries (default none)"}}), &["project_id", "start", "end"]),
         agent: true, meta: false, mutating: true, h_cut_range),
     tool!("cut_passage", "Cut ONE whole passage — 'the part where I demo the app', 'the tangent about my weekend' — in one call: pass the passage's first and last segment (from_segment_id, to_segment_id) or its start/end seconds. Everything between is cut, and both edges snap to the nearest sentence end or clear pause (within ~10 s) so the speech around the cut reads cleanly. Returns the cut range with its first and last words, so you can check it is the right passage. Use this instead of cutting scattered search hits. From the in-app chat this PROPOSES instead (nothing is cut until apply_cut_proposal).",
         || obj(json!({"project_id": pid_schema(), "from_segment_id": {"type": "string", "description": "first segment of the passage"}, "to_segment_id": {"type": "string", "description": "last segment of the passage"}, "start": {"type": "number", "description": "seconds, if not using segment ids"}, "end": {"type": "number"}}), &["project_id"]),
         agent: true, meta: false, mutating: true, h_cut_passage),
     tool!("restore_range", "Re-include a previously cut source time range. From the in-app chat it also drops proposed cuts there.",
-        || obj(json!({"project_id": pid_schema(), "start": {"type": "number"}, "end": {"type": "number"}}), &["project_id", "start", "end"]),
+        || obj(json!({"project_id": pid_schema(), "transcript_id": {"type": "string"}, "start": {"type": "number"}, "end": {"type": "number"}}), &["project_id", "start", "end"]),
         agent: true, meta: false, mutating: true, h_restore_range),
     tool!("cut_by_transcript", "Cut the video ranges covered by the given transcript segment ids. From the in-app chat this PROPOSES instead (nothing is cut until apply_cut_proposal).",
-        || obj(json!({"project_id": pid_schema(), "segment_ids": {"type": "array", "items": {"type": "string"}}}), &["project_id", "segment_ids"]),
+        || obj(json!({"project_id": pid_schema(), "transcript_id": {"type": "string"}, "segment_ids": {"type": "array", "items": {"type": "string"}}}), &["project_id", "segment_ids"]),
         agent: true, meta: false, mutating: true, h_cut_by_transcript),
     tool!("restore_by_transcript", "Restore the video ranges covered by the given transcript segment ids.",
-        || obj(json!({"project_id": pid_schema(), "segment_ids": {"type": "array", "items": {"type": "string"}}}), &["project_id", "segment_ids"]),
+        || obj(json!({"project_id": pid_schema(), "transcript_id": {"type": "string"}, "segment_ids": {"type": "array", "items": {"type": "string"}}}), &["project_id", "segment_ids"]),
         agent: true, meta: false, mutating: true, h_restore_by_transcript),
     tool!("trim_clip", "Move a clip's boundaries (drag-handle trim), frame-exact.",
         || obj(json!({"project_id": pid_schema(), "clip_id": {"type": "string"}, "new_source_in": {"type": "number"}, "new_source_out": {"type": "number"}}), &["project_id", "clip_id", "new_source_in", "new_source_out"]),
@@ -1606,7 +1886,7 @@ static REGISTRY: &[ToolSpec] = &[
     tool!("generate_captions", "Produce SRT captions for the current cut.",
         || obj(json!({"project_id": pid_schema()}), &["project_id"]),
         agent: false, meta: false, h_generate_captions),
-    tool!("export", "Export the current cut. target: premiere_xml | fcp_xml | resolve_xml | edl | otio | mp4 | srt | txt (plain-text transcript).",
+    tool!("export", "Export the current cut or source transcript. target: premiere_xml | fcp_xml | resolve_xml | resolve_manifest | edl | otio | mp4 | srt | txt | transcript_json.",
         || obj(json!({"project_id": pid_schema(), "target": {"type": "string"}, "out_path": {"type": "string"}}), &["project_id", "target", "out_path"]),
         agent: false, meta: false, h_export),
     tool!("find_clips", "Find the moments that work as standalone SHORT-FORM clips (YouTube Shorts / Reels / TikTok): sentence-aligned stretches of the current cut, scored 0-100 for a scroll-stopping hook, making sense with no context, and a payoff. Returns ranked candidates {id, start, end, pieces, duration, title, hook, reason, score}; they persist until the next run (get_clip_candidates). theme: only moments ABOUT this topic (a few words, e.g. 'AI tools' — found by transcript search, judged by the model). count (default 8, at most 60), min_s/max_s playable length bounds (default 15-60). scan: true judges moments from every part of the video and skips moments already saved as clips (use with a larger count, e.g. 40); it can take minutes, longer than some clients wait — the list still persists, so read it with get_clip_candidates. min_score drops moments the model scored below it. One run per project at a time. Scored by the app's model (on-device, unless the user switched the app to Hosted, then Claude) when reachable, else heuristically: method says which, and each candidate's scorer names the model. Save one with create_clip (rank), several with create_clips.",
@@ -1687,6 +1967,9 @@ static REGISTRY: &[ToolSpec] = &[
     tool!("get_history", "The full edit history oldest→newest: every applied edit then every undone (future) edit, each {id, kind, source, description, timestamp, applied}, plus current_index (newest applied; -1 = original).",
         || obj(json!({"project_id": pid_schema()}), &["project_id"]),
         agent: false, meta: false, h_get_history),
+    tool!("get_history_cut_review", "Read the saved cut review for a project history action.",
+        || obj(json!({"project_id": pid_schema(), "action_id": {"type": "string"}, "offset": {"type": "integer", "minimum": 0}}), &["project_id", "action_id"]),
+        agent: false, meta: false, h_get_history_cut_review),
     tool!("jump_to", "Go back (or forward) in time to a point in the edit history: undo/redo until the given action is the newest applied edit. null action_id = the original, before any edit.",
         || obj(json!({"project_id": pid_schema(), "action_id": {"type": "string"}}), &["project_id"]),
         agent: false, meta: false, mutating: true, h_jump_to),
@@ -1705,7 +1988,7 @@ static REGISTRY: &[ToolSpec] = &[
     tool!("get_preferences", "Get user preferences.", || obj(json!({}), &[]),
         agent: false, meta: false, h_get_preferences),
     tool!("set_preferences", "Update user preferences: pass only the keys to change (merged into the current preferences; unknown keys are rejected). Only the user, in the app, can point inference_endpoint off this machine.",
-        || obj(json!({"preferences": {"type": "object"}}), &["preferences"]),
+        || obj(json!({"preferences": {"type": "object"}, "expected_rule_sets": {"type": "array", "items": {"type": "object"}}}), &["preferences"]),
         agent: false, meta: false, h_set_preferences),
 ];
 
@@ -1727,8 +2010,12 @@ mod tests {
         // Each caller sees exactly its policy's rows.
         let agent = Caller::Agent { attribute_to: ActionSource::LocalAi };
         assert_eq!(defs(Caller::Ui).len(), REGISTRY.len());
-        assert_eq!(defs(Caller::Mcp).len(), REGISTRY.iter().filter(|s| !s.meta).count());
-        assert_eq!(defs(agent).len(), REGISTRY.iter().filter(|s| s.agent).count());
+        assert!(!defs(Caller::Mcp).iter().any(|tool| tool.name == "correct_transcript_segment"));
+        let visible = defs(agent);
+        assert!(visible.iter().any(|tool| tool.name == "cut_by_transcript"));
+        for name in ["apply_cut_proposal", "apply_edits", "accept_all_suggestions", "create_clip", "export"] {
+            assert!(!visible.iter().any(|tool| tool.name == name), "{name}");
+        }
     }
 
     #[test]

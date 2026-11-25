@@ -1,0 +1,40 @@
+RELEASE CHECKLIST: NO SHIP UNTIL ALL BLOCKERS PASS
+Status: intentionally incomplete
+
+SOURCE AND LICENSE
+[ ] Fork provenance and exact SHA recorded.
+[ ] GPL-3.0 and all third-party notices preserved.
+[ ] Commercial distribution/license plan reviewed and approved.
+[ ] Source archive/commit and reproducible build instructions available.
+
+SECURITY
+[ ] CSP enabled and reviewed.
+[ ] File asset scope least privilege, traversal/symlink tested.
+[ ] Runtime executable download pinned/hash verified.
+[ ] Local model download controls audited.
+[ ] MCP opt-in, permissions 0600, token rotation, origin, auth tested.
+[ ] Agent injection suite passed; no OS command tools exposed.
+[ ] Destructive action confirmation cannot be bypassed in release.
+[ ] No secret/transcript logging by default; local egress test passed.
+[ ] Dependency scans and SBOM attached; no unresolved high/critical issues.
+
+PRODUCT
+[ ] Select exact source; never fall back to wrong item.
+[ ] Offline transcription and word correction tested.
+[ ] Exact/phrase/filler/profanity custom rule selection works.
+[ ] Cut proposal review, exceptions, undo and restart tested.
+[ ] Frame-exact output and A/V sync verified in Resolve.
+[ ] New timeline only; original timeline and media remain unchanged.
+[ ] Free vs Studio vs version supported matrix documented honestly.
+[ ] Unsupported media types fail safely with explicit messages.
+
+DISTRIBUTION
+[ ] Installer signed/notarized; final binary artifact SHA recorded.
+[ ] Install, upgrade, uninstall and rollback tested on clean Mac.
+[ ] No hidden dependency/package install or admin permissions.
+[ ] Model/hosted-mode consent and privacy notice accurate.
+[ ] Beta feedback and crash paths reviewed.
+[ ] Explicit human approval to publish release and send communications.
+
+EVIDENCE
+Record owner, date, tested commit, attachment path and PASS/FAIL against every checkbox. A missing test is FAIL/UNVERIFIED, not PASS.

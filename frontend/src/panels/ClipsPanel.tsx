@@ -18,8 +18,8 @@ import {
 } from "../ipc/queries";
 import type { ClipCandidate, ClipFormat, ProgressEvent } from "../ipc/types";
 import { previewRanges, seekTo, setScreen } from "../state/viewStore";
-import { clock, errText, scoredBy, useElapsed } from "./clipUtil";
-import { modelLabel, useModelStatus } from "../state/modelStore";
+import { clock, errText, useElapsed } from "./clipUtil";
+import { modelLabel, scoredBy, useModelStatus } from "../state/modelStore";
 
 const LENGTHS: { label: string; min_s: number; max_s: number }[] = [
   { label: "15–30s", min_s: 15, max_s: 30 },

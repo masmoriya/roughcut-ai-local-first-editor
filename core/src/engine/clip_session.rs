@@ -58,7 +58,8 @@ impl Editor {
         let out = {
             let mut state = self.inner.state.lock().unwrap();
             let entry = state.get_mut(&project_id).ok_or_else(|| CoreError::NotFound("project".into()))?;
-            let ProjectState { project, undo, redo, .. } = entry;
+            let mut staged = entry.clone();
+            let ProjectState { project, undo, redo, .. } = &mut staged;
             let p = project.as_mut().ok_or_else(|| CoreError::NotFound("project".into()))?;
             if let Some(s) = &p.clip_session {
                 if s.clip_id == clip_id {
@@ -75,7 +76,7 @@ impl Editor {
                 .find(|c| c.id == clip_id)
                 .cloned()
                 .ok_or_else(|| CoreError::NotFound(format!("clip {clip_id}")))?;
-            // Set the main edit aside first: if that write fails, nothing changed.
+            // Save the main edit alongside the clip session and its journal.
             let main = MainEdit {
                 timeline: p.timeline.clone(),
                 cut_proposal: p.cut_proposal.clone(),
@@ -84,7 +85,7 @@ impl Editor {
                 undo: undo.clone(),
                 redo: redo.clone(),
             };
-            self.inner.store.set_kv(&main_key(project_id), &serde_json::to_string(&main)?)?;
+            let main_doc = serde_json::to_string(&main)?;
 
             let session = ClipEditSession { clip_id, title: clip.title.clone(), started_at: Utc::now() };
             p.timeline = clip.timeline.clone();
@@ -95,9 +96,11 @@ impl Editor {
             p.updated_at = Utc::now();
             undo.clear();
             redo.clear();
-            self.inner.store.save_project(p)?;
-            self.persist_journal(project_id, undo, redo)?;
-            (session, p.timeline.clone())
+            let journal = serde_json::json!({ "undo": undo, "redo": redo }).to_string();
+            self.inner.store.save_edit(p, None, &journal, Some((&main_key(project_id), &main_doc)))?;
+            let outcome = (session, p.timeline.clone());
+            *entry = staged;
+            outcome
         };
         self.session_events(project_id);
         Ok(out)
@@ -113,7 +116,8 @@ impl Editor {
         let out = {
             let mut state = self.inner.state.lock().unwrap();
             let entry = state.get_mut(&project_id).ok_or_else(|| CoreError::NotFound("project".into()))?;
-            let ProjectState { project, undo, redo, .. } = entry;
+            let mut staged = entry.clone();
+            let ProjectState { project, undo, redo, .. } = &mut staged;
             let p = project.as_mut().ok_or_else(|| CoreError::NotFound("project".into()))?;
             let session =
                 p.clip_session.clone().ok_or_else(|| CoreError::InvalidArg("no clip is open in the Editor".into()))?;
@@ -157,10 +161,11 @@ impl Editor {
             p.updated_at = Utc::now();
             *undo = main.undo;
             *redo = main.redo;
-            self.inner.store.save_project(p)?;
-            self.persist_journal(project_id, undo, redo)?;
-            self.inner.store.set_kv(&main_key(project_id), "")?;
-            (saved, p.timeline.clone())
+            let journal = serde_json::json!({ "undo": undo, "redo": redo }).to_string();
+            self.inner.store.save_edit(p, None, &journal, Some((&main_key(project_id), "")))?;
+            let outcome = (saved, p.timeline.clone());
+            *entry = staged;
+            outcome
         };
         self.session_events(project_id);
         Ok(out)

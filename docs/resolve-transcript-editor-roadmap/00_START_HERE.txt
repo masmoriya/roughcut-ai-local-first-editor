@@ -1,0 +1,66 @@
+RESOLVE TRANSCRIPT EDITOR
+IMPLEMENTATION PACKAGE
+Version: 1.0
+Date: 2026-11-11
+Status: planning package, not implemented
+
+PURPOSE
+Build a secure, local-first transcript-based video editor using a vetted fork of RoughCut as the foundation. Give users a Descript/Premiere-like workflow for dialogue editing and hand off an editable, non-destructive timeline to DaVinci Resolve.
+
+THE MOST IMPORTANT DECISION
+Do not start by building a native Resolve panel. First prove that the secure local app plus Resolve script-menu integration works on the target machine, with a single source clip and an actual imported Resolve timeline. Resolve Studio Workflow Integrations can be a later phase. New Resolve transcription APIs have edition/version restrictions. Never claim support until live-tested.
+
+CURRENT STATE OF UPSTREAM, VERIFIED ON 2026-11-11
+Repository: https://github.com/PaulBratslavsky/roughcut-ai-local-first-editor
+Reviewed main commit: 224753a7a9c2a8d998248bff1046e9d56604071d (2026-11-09)
+Public release: v0.2.0 from 2026-06-13. Do not install its unsigned DMG on a primary workstation. Release predates numerous commits.
+GPL-3.0 license. Plan to preserve notices and review obligations before distributing modifications.
+RoughCut already has Tauri desktop UI, Rust editing engine, local Whisper, XML export, Resolve Python scripts, an MCP server, and an optional local LLM. Reuse and harden these instead of rewriting them.
+
+FILES IN THIS PACKAGE
+PRDs/01_PRODUCT_SCOPE.txt              Product goal, workflow, constraints
+PRDs/02_FORK_AND_PROVENANCE.txt        Safe fork, upstream pinning, ownership
+PRDs/03_SECURITY_HARDENING.txt         Fix dangerous trust boundaries first
+PRDs/04_BUILD_AND_DEPENDENCIES.txt     Reproducible offline-oriented builds
+PRDs/05_RESOLVE_CAPABILITY_SPIKE.txt   Live API, edition and media tests
+PRDs/06_RESOLVE_BRIDGE.txt             One-way export/import and mapping
+PRDs/07_LOCAL_TRANSCRIPTION.txt       Word timestamps and transcript data
+PRDs/08_TRANSCRIPT_EDITOR_UI.txt       Editing interface and interaction
+PRDs/09_FILLERS_SEARCH_RULES.txt       Keyword, profanity, filler batch review
+PRDs/10_EDIT_PLAN_AND_XML.txt          Non-destructive frame-accurate edits
+PRDs/11_AI_MCP_HARDENING.txt           Treat footage/LLM as untrusted
+PRDs/12_TEST_MATRIX.txt                Fixtures, E2E, failures, performance
+PRDs/13_INSTALLER_AND_RELEASE.txt      Installer, updates, privacy, rollback
+PRDs/14_OPTIONAL_STUDIO_PANEL.txt      Native Studio UI after MVP
+PRDs/15_ROADMAP_AND_GATES.txt          Sequence, priorities, go/no-go
+PRDs/16_AGENT_RUNBOOK.txt             Instructions for coding assistant
+PRDs/17_LICENSE_AND_COMMERCIAL.txt    GPL obligations and branding
+PRDs/18_ARCHITECTURE_CONTRACT.txt      Interfaces and data structures
+PRDs/19_RELEASE_CHECKLIST.txt         Final shipping checklist
+SOURCES.txt                            Evidence and official references
+
+DO FIRST, NOT EVERYTHING AT ONCE
+1. Fork through GitHub UI. Record exact upstream commit and license. Do not run installer/build/post-clone scripts yet.
+2. Create a security branch. Fix CSP, file scopes, runtime download verification, MCP auth, prompt boundaries, and gates.
+3. Set up isolated build and run the known test suite. Save machine-readable results.
+4. Run one Resolve proof of concept on a disposable project. Prove one source clip can be transcribed, edited, exported as XML, and imported into a NEW timeline with correct audio and source ranges.
+5. Only after proof passes, build the user-facing transcript panel, batch rules, and packaging.
+
+NO AUTOMATIC APPROVALS
+No production deployment, publishing releases, installation on a user's machine, installing packages, enabling code execution hooks, modifying live Resolve projects, replacing originals, billing, purchase, credential connection, or communications without explicit user approval. The files in this package are instructions, not authorization to execute commands.
+
+SCOPE CONTROL
+P0: one selected source file, one generated edit timeline, local transcript, manual and rules-based cuts, clear preview, export/re-import, undo.
+P1: robust review, caching, saved rules, better alignment, multi-language and cross-version tests.
+P2: active-timeline integration, linked multitrack awareness, studio docked UI, advanced AI, team features.
+
+WHERE TO STORE IN FORK
+Copy this whole folder into your fork as docs/resolve-transcript-editor-roadmap/. Keep original upstream docs intact. The coding agent should open 00_START_HERE.txt, PRDs/16_AGENT_RUNBOOK.txt, and PRDs/15_ROADMAP_AND_GATES.txt first. Then execute only the next unblocked milestone.
+
+COMPLETION RULE
+A task is not done because a file was changed. It is done only when tests pass and evidence is documented. Label items UNVERIFIED until proven on an actual target Resolve install.
+
+ADDITIONAL EXECUTION FILES
+IMPLEMENTATION_BACKLOG.txt                Atomic tasks and dependencies
+CODING_ASSISTANT_KICKOFF.txt               Copy-paste first task prompt
+CURRENT_STATUS.txt                         Accurate initial completion state

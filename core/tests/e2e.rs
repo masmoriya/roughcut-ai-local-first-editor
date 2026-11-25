@@ -126,7 +126,7 @@ async fn poc_loop_through_the_tool_registry() {
     assert!(undone["action"].is_object() || undone["action"].is_null());
 
     // 7. Export NLE interchange + captions; verify shape.
-    let dir = std::env::temp_dir().join("roughcut-e2e");
+    let dir = tempfile::tempdir().unwrap();
     for (target, ext, needle) in [
         ("premiere_xml", "xml", "<xmeml"),
         ("fcp_xml", "fcpxml", "<fcpxml"),
@@ -135,7 +135,7 @@ async fn poc_loop_through_the_tool_registry() {
         ("srt", "srt", "-->"),
         ("txt", "txt", " "),
     ] {
-        let out = dir.join(format!("export.{ext}"));
+        let out = dir.path().join(format!("export.{ext}"));
         let r = call(
             &editor,
             "export",
@@ -145,6 +145,49 @@ async fn poc_loop_through_the_tool_registry() {
         let content = std::fs::read_to_string(r["path"].as_str().unwrap()).unwrap();
         assert!(content.contains(needle), "{target} export missing {needle}");
     }
+
+    let resolve_dir = tempfile::tempdir().unwrap();
+    let resolve_xml = resolve_dir.path().join("edited.xml");
+    let export = call(&editor, "export", json!({
+        "project_id": pid, "target": "resolve_xml", "out_path": resolve_xml,
+    })).await;
+    let first_xml = std::fs::read_to_string(&resolve_xml).unwrap();
+    assert!(first_xml.contains("<xmeml"));
+    let receipt = &export["resolve_timeline"];
+    let manifest: Value = serde_json::from_str(receipt["manifest"].as_str().unwrap()).unwrap();
+    use sha2::{Digest, Sha256};
+    let checksum = format!("{:x}", Sha256::digest(first_xml.as_bytes()));
+    assert_eq!(receipt["xml_sha256"], json!(checksum));
+    assert_eq!(manifest["xml_sha256"], receipt["xml_sha256"]);
+    assert_eq!(manifest["timeline_name"], receipt["name"]);
+    assert_eq!(manifest["timeline_frames"], receipt["timeline_frames"]);
+    assert_eq!(manifest["cut_plan_version"], receipt["cut_plan_version"]);
+    let mut timeline_end = 0;
+    for span in manifest["kept_spans"].as_array().unwrap() {
+        let source_in = span["source_in_frame"].as_i64().unwrap();
+        let source_out = span["source_out_frame"].as_i64().unwrap();
+        let timeline_in = span["timeline_in_frame"].as_i64().unwrap();
+        let timeline_out = span["timeline_out_frame"].as_i64().unwrap();
+        assert_eq!(timeline_in, timeline_end);
+        assert!(timeline_out > timeline_in);
+        assert_eq!(source_out - source_in, timeline_out - timeline_in);
+        timeline_end = timeline_out;
+    }
+    assert_eq!(manifest["timeline_frames"], json!(timeline_end));
+    let export_id = uuid::Uuid::parse_str(manifest["xml_export_id"].as_str().unwrap()).unwrap();
+    let suffix = export_id.simple().to_string();
+    assert!(first_xml.contains(&suffix[..12]));
+    assert!(editor.export(uuid::Uuid::parse_str(&pid).unwrap(), "resolve_xml", resolve_xml.to_str().unwrap()).await.is_err());
+    assert_eq!(std::fs::read_to_string(&resolve_xml).unwrap(), first_xml);
+    let second_export = call(&editor, "export", json!({
+        "project_id": pid, "target": "resolve_xml", "out_path": resolve_dir.path().join("second.xml"),
+    })).await;
+    let second_receipt = &second_export["resolve_timeline"];
+    let second_manifest: Value = serde_json::from_str(second_receipt["manifest"].as_str().unwrap()).unwrap();
+    assert_ne!(second_manifest["xml_export_id"], manifest["xml_export_id"]);
+    assert_ne!(second_receipt["name"], receipt["name"]);
+    assert_eq!(second_manifest["cut_plan_version"], manifest["cut_plan_version"]);
+    assert_eq!(second_manifest["kept_spans"], manifest["kept_spans"]);
 
     // 8. Metadata: chapters from the transcript.
     let chapters = call(&editor, "generate_chapters", json!({ "project_id": pid })).await;
@@ -364,6 +407,13 @@ async fn apply_edits_batches_ops_in_one_call() {
     )
     .await;
     assert_ne!(copy["id"], json!(pid));
+    let copy_id = copy["id"].as_str().unwrap();
+    let source_transcript = call(&editor, "get_transcript", json!({ "project_id": pid })).await;
+    let copy_transcript = call(&editor, "get_transcript", json!({ "project_id": copy_id })).await;
+    assert!(!source_transcript["segments"].as_array().unwrap().is_empty());
+    assert_eq!(copy_transcript["segments"], source_transcript["segments"]);
+    let copy_undo = call(&editor, "undo", json!({ "project_id": copy_id })).await;
+    assert!(copy_undo["action"].is_null());
     // Carries the full post-rough-cut state (manual + AI cuts).
     assert_eq!(
         copy["timeline"]["cut_count"].as_u64().unwrap(),
@@ -825,6 +875,31 @@ async fn history_and_jump_in_time() {
         call(&editor, "create_project", json!({ "name": "hist", "file_path": "/demo/a.mp4" })).await;
     let pid = project["id"].as_str().unwrap().to_string();
     call(&editor, "transcribe", json!({ "project_id": pid })).await;
+    let timeline = call(&editor, "get_timeline", json!({ "project_id": pid })).await;
+    for command in ["cut_range", "restore_range"] {
+        let rejected = tools::dispatch(&editor, command, &json!({
+            "project_id": pid,
+            "transcript_id": uuid::Uuid::nil(),
+            "start": 1.0,
+            "end": 2.0,
+        }), Caller::Ui).await.unwrap_err();
+        assert_eq!(rejected.code(), "unavailable");
+    }
+    let before = call(&editor, "open_project", json!({ "project_id": pid })).await;
+    for command in ["highlight_source_ranges", "protect_source_ranges"] {
+        let rejected = tools::dispatch(&editor, command, &json!({
+            "project_id": pid,
+            "transcript_id": uuid::Uuid::nil(),
+            "ranges": [{ "start": 1.0, "end": 2.0 }],
+        }), Caller::Ui).await.unwrap_err();
+        assert_eq!(rejected.code(), "unavailable");
+    }
+    let after = call(&editor, "open_project", json!({ "project_id": pid })).await;
+    assert_eq!(before["highlighted_ranges"], after["highlighted_ranges"]);
+    assert_eq!(before["protected_ranges"], after["protected_ranges"]);
+    assert_eq!(call(&editor, "get_timeline", json!({ "project_id": pid })).await, timeline);
+    let history = call(&editor, "get_history", json!({ "project_id": pid })).await;
+    assert_eq!(history["entries"], json!([]));
     // Three edits.
     let a1 = call(&editor, "cut_range", json!({ "project_id": pid, "start": 1.0, "end": 2.0 }))
         .await["action"]["id"]
@@ -1112,6 +1187,26 @@ async fn a_scan_that_loses_the_network_says_which_model_scored_what() {
 }
 
 #[tokio::test]
+async fn desktop_preferences_keep_model_settings_disabled() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = roughcut_core::store::SqliteStore::open(&directory.path().join("library.sqlite")).unwrap();
+    let editor = Editor::bootstrap_with_store(Box::new(store), std::sync::Arc::new(roughcut_core::events::NullSink)).unwrap();
+    let disabled = editor.transcribe_audio_stream(uuid::Uuid::nil(), None, None).await.unwrap_err();
+    assert_eq!(disabled.code(), "unavailable");
+    assert!(disabled.to_string().contains("Import a timed JSON or SRT transcript"));
+    let before = editor.get_preferences().unwrap();
+    let denied = tools::dispatch(&editor, "set_preferences", &json!({
+        "preferences": { "inference_endpoint": "https://example.invalid/v1" },
+    }), Caller::Ui).await;
+    assert!(denied.is_err());
+    let updated = call(&editor, "set_preferences", json!({
+        "preferences": { "never_cut_phrases": ["keep this"] },
+    })).await;
+    assert_eq!(updated["never_cut_phrases"], json!(["keep this"]));
+    assert_eq!(editor.get_preferences().unwrap().inference_endpoint, before.inference_endpoint);
+}
+
+#[tokio::test]
 async fn set_preferences_patches_and_guards_egress() {
     let editor = Editor::test_instance();
     let before = call(&editor, "get_preferences", json!({})).await;
@@ -1285,9 +1380,9 @@ async fn clips_find_save_export() {
 
     // 5. Export: the same writers over the clip's timeline. Captions start
     // at the clip's own 00:00:00, not the source time.
-    let dir = std::env::temp_dir().join("roughcut-e2e-clips");
+    let dir = tempfile::tempdir().unwrap();
     for (target, needle) in [("edl", "TITLE:"), ("srt", "00:00:00,"), ("txt", " ")] {
-        let out = dir.join(format!("clip.{target}"));
+        let out = dir.path().join(format!("clip.{target}"));
         let r = call(
             &editor,
             "export_clip",
@@ -1795,6 +1890,70 @@ async fn retime_words_needs_the_audio_and_changes_nothing_without_it() {
 }
 
 #[tokio::test]
+async fn merged_phrase_cuts_keep_distinct_match_identities() {
+    let editor = Editor::test_instance();
+    let project = call(&editor, "create_project", json!({ "name": "phrase review", "file_path": "/demo/footage.mp4" })).await;
+    let project_id = &project["id"];
+    call(&editor, "transcribe", json!({ "project_id": project_id })).await;
+    let transcript = call(&editor, "get_transcript", json!({ "project_id": project_id })).await;
+    let search = json!({
+        "project_id": project_id, "transcript_id": transcript["id"], "category": "search",
+        "ranges": [
+            { "start": 10.0, "end": 12.0, "occurrenceKey": "first", "ruleKey": "phrase one" },
+            { "start": 10.0, "end": 12.0, "occurrenceKey": "first", "ruleKey": "phrase one" },
+            { "start": 11.0, "end": 13.0, "occurrenceKey": "second", "ruleKey": "phrase two" },
+        ],
+    });
+    let proposed = call(&editor, "review_search_cuts", search.clone()).await;
+    assert_eq!(proposed["proposed"], 1);
+    let pending = call(&editor, "get_cut_proposal", json!({ "project_id": project_id })).await;
+    let proposal = &pending["proposal"];
+    let applied = call(&editor, "apply_cut_proposal", json!({
+        "project_id": project_id, "proposal_id": proposal["id"],
+        "selected_cut_ids": [proposal["cuts"][0]["id"]],
+    })).await;
+    let review = call(&editor, "get_history_cut_review", json!({
+        "project_id": project_id, "action_id": applied["action"]["id"],
+    })).await;
+    assert!(applied["action"].get("cut_review").is_none());
+    let matches = review["decisions"][0]["phrase_matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 2);
+    assert_ne!(matches[0]["rule_id"], matches[1]["rule_id"]);
+    assert_ne!(matches[0]["match_id"], matches[1]["match_id"]);
+
+    call(&editor, "undo", json!({ "project_id": project_id })).await;
+    call(&editor, "review_search_cuts", search).await;
+    let pending = call(&editor, "get_cut_proposal", json!({ "project_id": project_id })).await;
+    let proposal = &pending["proposal"];
+    call(&editor, "protect_source_ranges", json!({
+        "project_id": project_id, "proposal_id": proposal["id"],
+        "transcript_id": transcript["id"], "split_cut_id": proposal["cuts"][0]["id"],
+        "ranges": [{ "start": 10.0, "end": 12.0 }],
+    })).await;
+    let revised = call(&editor, "get_cut_proposal", json!({ "project_id": project_id })).await;
+    let revised = &revised["proposal"];
+    assert_ne!(revised["id"], proposal["id"]);
+    assert_eq!(revised["total"], 1);
+    assert_eq!(revised["cuts"][0]["start"], 12.0);
+    assert_eq!(revised["cuts"][0]["end"], 13.0);
+    let stale = tools::dispatch(&editor, "apply_cut_proposal", &json!({
+        "project_id": project_id, "proposal_id": proposal["id"],
+        "selected_cut_ids": [proposal["cuts"][0]["id"]],
+    }), Caller::Ui).await.unwrap_err();
+    assert_eq!(stale.code(), "unavailable");
+    let applied = call(&editor, "apply_cut_proposal", json!({
+        "project_id": project_id, "proposal_id": revised["id"],
+        "selected_cut_ids": [revised["cuts"][0]["id"]],
+    })).await;
+    assert_eq!(applied["applied"], 1);
+    let timeline = call(&editor, "get_timeline", json!({ "project_id": project_id })).await;
+    assert!(timeline["clips"].as_array().unwrap().iter().any(|clip| {
+        clip["included"] == true && clip["source_in"].as_f64().unwrap() <= 10.0
+            && clip["source_out"].as_f64().unwrap() >= 12.0
+    }));
+}
+
+#[tokio::test]
 async fn proposed_cuts_change_nothing_until_applied_and_apply_as_one_undo() {
     let editor = Editor::test_instance();
     let p = call(&editor, "create_project", json!({ "name": "review", "file_path": "/demo/footage.mp4" })).await;
@@ -1816,9 +1975,47 @@ async fn proposed_cuts_change_nothing_until_applied_and_apply_as_one_undo() {
     let skipped = call(&editor, "skip_proposed_cuts", json!({ "project_id": pid, "kind": "pause" })).await;
     let pauses = rough["pauses"].as_u64().unwrap();
     assert_eq!(skipped["changed"].as_u64().unwrap(), pauses);
+    let preferences = call(&editor, "get_preferences", json!({})).await;
+    call(&editor, "set_preferences", json!({
+        "preferences": { "keyword_phrases": ["new review keyword"] },
+    })).await;
+    let stale = tools::dispatch(&editor, "apply_cut_proposal", &json!({ "project_id": pid }), Caller::Ui)
+        .await.unwrap_err();
+    assert_eq!(stale.code(), "unavailable");
+    assert!(stale.to_string().contains("phrase lists changed"));
+    let unchanged = call(&editor, "get_timeline", json!({ "project_id": pid })).await;
+    assert_eq!(unchanged["cut_count"], 0);
+    call(&editor, "set_preferences", json!({
+        "preferences": { "keyword_phrases": preferences["keyword_phrases"] },
+    })).await;
     let applied = call(&editor, "apply_cut_proposal", json!({ "project_id": pid })).await;
     assert_eq!(applied["applied"].as_u64().unwrap(), total - pauses);
     assert_eq!(applied["skipped"].as_u64().unwrap(), pauses);
+    let history = call(&editor, "get_history", json!({ "project_id": pid })).await;
+    let action = &history["entries"][0];
+    assert_eq!(action["has_cut_review"], true);
+    let review_args = json!({ "project_id": pid, "action_id": action["id"] });
+    assert!(!tools::defs(Caller::Mcp).iter().any(|tool| tool.name == "get_history_cut_review"));
+    let review = call(&editor, "get_history_cut_review", review_args.clone()).await;
+    let decisions = review["decisions"].as_array().unwrap();
+    assert_eq!(review["total"], json!(total));
+    assert_eq!(decisions.len() as u64, total.min(50));
+    let mut kept = decisions.iter().filter(|decision| decision["approved"] == false).count() as u64;
+    for offset in (50..total).step_by(50) {
+        let page = call(&editor, "get_history_cut_review", json!({
+            "project_id": pid, "action_id": action["id"], "offset": offset,
+        })).await;
+        let page_decisions = page["decisions"].as_array().unwrap();
+        assert_eq!(page["total"], json!(total));
+        assert_eq!(page_decisions.len() as u64, (total - offset).min(50));
+        kept += page_decisions.iter().filter(|decision| decision["approved"] == false).count() as u64;
+    }
+    assert_eq!(kept, pauses);
+    let exhausted = call(&editor, "get_history_cut_review", json!({
+        "project_id": pid, "action_id": action["id"], "offset": total,
+    })).await;
+    assert_eq!(exhausted["total"], json!(total));
+    assert_eq!(exhausted["decisions"], json!([]));
     let tl = call(&editor, "get_timeline", json!({ "project_id": pid })).await;
     for c in cuts.iter().filter(|c| c["kind"] == "pause") {
         let mid = (c["start"].as_f64().unwrap() + c["end"].as_f64().unwrap()) / 2.0;
@@ -1829,6 +2026,7 @@ async fn proposed_cuts_change_nothing_until_applied_and_apply_as_one_undo() {
     }
     // One undo takes the whole proposal back.
     call(&editor, "undo", json!({ "project_id": pid })).await;
+    assert_eq!(call(&editor, "get_history_cut_review", review_args).await, review);
     let tl = call(&editor, "get_timeline", json!({ "project_id": pid })).await;
     assert_eq!(tl["cut_count"], 0);
 

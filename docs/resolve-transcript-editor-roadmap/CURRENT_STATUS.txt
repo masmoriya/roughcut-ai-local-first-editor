@@ -1,0 +1,26 @@
+PROJECT STATUS ON 2026-11-11
+
+PLANNING PACKAGE: COMPLETE
+FORK: NOT CREATED IN THIS SESSION
+SECURITY PATCHES: NOT APPLIED
+DEPENDENCY AUDIT: TARGETED STATIC REVIEW ONLY; NO FULL SCANNER OR EXECUTION
+SOURCE BUILD: NOT PERFORMED
+LOCAL TRANSCRIPTION TEST: NOT PERFORMED
+REAL RESOLVE INTEGRATION TEST: NOT PERFORMED
+INSTALLER: NOT BUILT
+RELEASE: NOT APPROVED
+
+UPSTREAM BASELINE
+https://github.com/PaulBratslavsky/roughcut-ai-local-first-editor
+224753a7a9c2a8d998248bff1046e9d56604071d
+
+KNOWN BLOCKERS
+1. Original Tauri CSP disabled and broad media file asset scope.
+2. Some optional executable downloads unpinned/unhashed.
+3. MCP token file and opt-in/release permission hardening outstanding.
+4. Untrusted transcript content can reach LLM context; prompt injection safeguards require tests.
+5. Exact Resolve Free/Studio/version behavior unverified on a local target install.
+6. GPL-3.0 distribution strategy and component notices not signed off.
+
+NEXT STEP
+Fork, pin baseline, then begin F02 with CODING_ASSISTANT_KICKOFF.txt.
