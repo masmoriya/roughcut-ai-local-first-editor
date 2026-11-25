@@ -186,22 +186,21 @@ There are no subdirectories.
 
 ### Transcript writers (`srt`, `txt`)
 
-- A transcript segment is in the cut when its midpoint `(start + end) / 2`
-  falls in `[source_in, source_out)` of some clip with `included == true`.
-  Both writers apply this test to `timeline.clips`.
+- Both writers keep words whose source midpoint falls within an included clip's
+  half-open source interval. A segment with no word timings uses its own
+  midpoint. When all words survive, the segment retains its corrected text and
+  timing. When some survive, the writers join the retained words and use their
+  first start and last end. Silence and empty text are skipped.
 - **SRT**:
-  - Skips a segment when `is_silence` is true, when `text.is_empty()` (the text
-    is not trimmed, so whitespace-only text is still written), when it is not
-    in the cut, or when its mapped end is at or before its mapped start.
-  - Cue times are `Timeline::source_to_output(seg.start.max(0.0))` and
-    `Timeline::source_to_output(seg.end)`. `source_to_output` skips excluded
-    regions (`core/src/model.rs`).
+  - Maps the retained source bounds through `Timeline::source_to_output` to
+    skip excluded regions. Drops cues with no positive output duration after
+    rounding and removes blank lines from cue text.
   - Cues are numbered from 1, and the number increases only when a cue is
     written.
   - Timestamps are `HH:MM:SS,mmm`, rounded to the millisecond.
   - Each cue is `"{n}\n{start} --> {end}\n{text}\n\n"`.
 - **TXT**:
-  - Uses `seg.text.trim()`.
+  - Trims the retained text before joining paragraphs.
   - A silence, a segment that is empty after trimming, or a segment outside
     the cut ends the current paragraph.
   - Segments within a paragraph are joined with a single space, and

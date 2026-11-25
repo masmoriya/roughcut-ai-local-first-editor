@@ -1,0 +1,45 @@
+PRD 04: REPRODUCIBLE BUILDS AND DEPENDENCY VERIFICATION
+Priority: P0 / Gate G1
+
+GOAL
+Create a trustworthy chain from pinned source to a testable local build without using unreviewed install scripts on a personal editing workstation.
+
+REQUIREMENTS
+1. Use an isolated disposable macOS development environment or VM where possible. Keep production footage and credentials absent.
+2. Pin Rust toolchain, Node LTS, Tauri CLI and application dependencies. Keep Cargo.lock and frontend/package-lock.json committed. Avoid unpinned npx --yes install in release path.
+3. Review all package lifecycle scripts and Rust build.rs files before enabling them. Verify source registries and checksums. Monitor new transitive dependencies on updates.
+4. Compare GitHub release binary (if later downloaded for analysis) with source-built functionality; do not assume existing unsigned DMG matches current main.
+5. Add dependency vulnerability reporting (cargo audit, npm audit, OSV or equivalent) to CI. Scanner output is evidence, not automatic declaration of safety. Distinguish reachable vulnerabilities and false positives.
+6. Generate SBOM and third-party attribution file. Identify libraries with incompatible distribution requirements.
+7. Run offline fixture tests before full GUI execution. Only start app in sandbox after G1 review; use a disposable user and project.
+8. Do not grant Full Disk Access, accessibility, screen recording or automation privileges unless required by tested workflow. Explain each permission.
+9. Record exact hash for all release artifacts and dependency/model downloads. Sign and notarize macOS builds before general distribution.
+10. CI shall not publish releases just because a tag exists without required approvals and successful security/test gates.
+
+IMPL PATHS
+Cargo.toml; Cargo.lock
+frontend/package.json; frontend/package-lock.json
+.github/workflows/ci.yml
+.github/workflows/release.yml
+scripts/build-macos-app.sh
+app/src-tauri/Cargo.toml
+app/src-tauri/build.rs
+core/Cargo.toml
+core/src/setup.rs
+core/src/download.rs
+docs/resolve-transcript-editor/security/SBOM.txt (new)
+docs/resolve-transcript-editor/security/BUILD_PROVENANCE.txt (new)
+
+BASELINE TEST COMMANDS, ONLY AFTER APPROVAL FOR EXECUTION
+cargo test -p roughcut-core
+cargo build -p roughcut-mcp-shim
+cd frontend && npm ci && npm run build
+cd app/src-tauri && cargo tauri build
+These are references, not instructions to run them on an untrusted host immediately. Sandbox and verify first.
+
+ACCEPTANCE
+B-01 Clean isolated checkout reproduces a passing test build from exact lockfiles.
+B-02 Zero unexpected remote hosts contacted in the post-setup local editing test.
+B-03 All executable/runtime downloads are verified and source + hash recorded.
+B-04 SBOM, lockfiles, security results and artifact hashes attached to candidate build.
+B-05 Test/release commands are distinct; release job requires explicit promotion.

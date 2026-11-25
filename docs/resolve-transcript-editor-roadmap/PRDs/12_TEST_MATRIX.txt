@@ -1,0 +1,55 @@
+PRD 12: AUTOMATED QA AND LIVE EDITING TEST MATRIX
+Priority: P0 continuous / Gates G1-G5
+
+GOAL
+Establish objective tests that detect data loss, unexpected network access, timecode drift, security regressions and real Resolve incompatibilities.
+
+TEST TIERS
+T0 Static: source/provenance, dependency scans, dangerous defaults, formatting, lint, unit tests.
+T1 Core: Rust edit-plan, transcription parse, normalized rules, undo/redo, file paths, MCP authorization.
+T2 UI: frontend typecheck/build, keyboard and screen-reader regression, mocked transcript editing workflow.
+T3 Local app: isolated macOS Tauri runtime, ffmpeg and model setup, media import, cache and export with no Resolve.
+T4 Resolve: real installed free and Studio edition separately; actual script-menu handoff, import, media/link/timecode validation.
+T5 Release: signing, notarization, permissions, installation, upgrade, uninstall, rollback, offline mode and network egress.
+
+FIXTURES (SYNTHETIC OR LICENSED ONLY)
+F01 15-second mono spoken sample, 24 fps, exact transcript and one filler.
+F02 60-second stereo talking head, 30 fps, multiple ums and distinct named entities.
+F03 30-minute 29.97 fps source with 50 planned cuts and audio sync reference.
+F04 25 fps/23.976 fps samples with non-zero source timecode.
+F05 MOV/MP4 path with spaces, accents, Japanese characters and ampersand.
+F06 Two similar names in Resolve bin to expose wrong-clip selection.
+F07 Many speakers and simultaneous speech.
+F08 Long silence, cough/noise, clipped words, music bed, poor mic quality.
+F09 60-minute transcript performance sample.
+F10 Malicious transcript containing prompt injection, misleading tool text, fake JSON and unicode confusables.
+F11 Offline/unreadable media, missing files, moved media and stale model.
+F12 Media with nonstandard frame rate / VFR, multicam or detached audio. Must yield safe unsupported notice if not supported.
+
+HARNESS OUTPUT
+New: tests/fixtures/manifest.json with input hashes, fps rational, expected transcript words, expected frame ranges.
+New: tests/security/ for token, media scope, origin and prompt injection tests.
+New: tests/resolve_integration/ with scripts to run from Resolve's console plus evidence output (no machine secrets).
+New: docs/resolve-transcript-editor/evidence/ for dated test summaries, versions, logs, diffs and artifact SHA-256.
+
+TEST CASES AND THRESHOLDS
+QA-01 SHA-256(original media) before == after every operation.
+QA-02 Each expected keep/cut frame interval matches exported XML and actual Resolve imported timeline within 1 frame for CFR fixtures.
+QA-03 Every cut preserves embedded audio sync; tests include 50-cut long sample.
+QA-04 Undo/redo+restart restores bit-identical edit plan serialization.
+QA-05 No network egress in local-only session after model prep; only localhost for intentional MCP/LLM.
+QA-06 Failed model download cannot leave executable unverified binary.
+QA-07 Cancelled transcription/export leaves no corrupt project state or leaked orphaned temp output.
+QA-08 Failure paths: app crashes between preview/apply; Resolve closes while importing; output folder unwritable; media relink fails.
+QA-09 Full 60-min transcript scroll/search memory and responsiveness measured; do not declare threshold before baseline measurements.
+QA-10 No destructive AI/MCP call can bypass confirmation via malformed JSON, replay, stale token or environment switch.
+QA-11 GUI regression for individual/select-all/deselect/protect results; wrong matching never silently cuts.
+QA-12 Antivirus/signature results and OS permissions documented; no unreviewed binary bundles.
+
+EXISTING TEST COMMANDS (execute only in approved sandbox)
+cargo test -p roughcut-core
+cd frontend && npm run build
+Add integration harness, avoid pretending existing unit tests prove integration in Resolve.
+
+GATE REPORT FORMAT
+Test run date; repository SHA; OS/CPU; Resolve edition/version; Node/Rust versions; local model hashes; fixture IDs; passing tests; failing tests; known limitations; network evidence; user approval for the next gate.

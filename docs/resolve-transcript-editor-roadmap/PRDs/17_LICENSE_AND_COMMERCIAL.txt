@@ -1,0 +1,30 @@
+PRD 17: OPEN SOURCE LICENSE, BRAND AND DISTRIBUTION DECISION
+Priority: P0 decision before distributing modified binaries
+
+KNOWN
+RoughCut is GPL-3.0 licensed. Forking, inspecting and privately modifying source code is allowed subject to license. Distribution of modified GPL-covered binaries can carry corresponding-source, license notice and attribution obligations. This is a planning statement, not legal advice.
+
+DECISION REQUIRED
+Are we building (A) an open-source GPL-3.0 fork and extension, (B) a separate proprietary Resolve client that communicates at arm's length with a GPL app, or (C) a clean-room alternative? Do not assume separation by process/MCP alone resolves all derivative-work questions. Get qualified counsel before shipping commercial proprietary integration.
+
+DEFAULT FOR MVP
+Keep the fork clearly GPL-3.0, retain upstream notices and source availability, avoid integrating it into unrelated proprietary application code, and maintain separate product identity/branding. No license re-labeling.
+
+REQUIREMENTS
+LIC-01 Retain LICENSE, third-party notices, source provenance, upstream contributor attribution.
+LIC-02 Record all source modifications and link a corresponding-source archive/commit for any distributed GPL binary.
+LIC-03 Scan all Rust, Node, ffmpeg, whisper, model weights, fonts and runtime components for their own license conditions. Some model files have separate use restrictions.
+LIC-04 Do not copy vendor trademarks/branding in a way implying affiliation.
+LIC-05 Before shipping proprietary products: obtain legal advice on GPL coupling, IPC boundary, source obligations, patent clauses, installer obligations and distribution jurisdictions.
+LIC-06 Separate license approvals from technical test success. Passing CI does not mean distribution is legally cleared.
+LIC-07 Identify which hosted APIs, if any, have privacy terms and contractual data handling obligations.
+
+ARTIFACTS
+New: docs/resolve-transcript-editor/legal/LICENSE_DECISION.txt
+New: docs/resolve-transcript-editor/legal/THIRD_PARTY_NOTICES.txt
+New: docs/resolve-transcript-editor/legal/DISTRIBUTION_CHECKLIST.txt
+
+ACCEPTANCE
+LIC-T1 Every shipped component has identified license/source or explicit exception.
+LIC-T2 Distribution choice documented and approved before public binary.
+LIC-T3 No release proceeds with unresolved GPL/commercial questions.

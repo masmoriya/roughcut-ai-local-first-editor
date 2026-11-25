@@ -1,13 +1,15 @@
 use crate::engine::Editor;
 use crate::error::Result;
 use crate::tools;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
 use rand::distributions::Alphanumeric;
 use rand::Rng;
 use serde_json::{json, Value};
+use std::io::Write;
+use std::path::Path;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
@@ -15,15 +17,16 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 struct McpState {
     editor: Editor,
     token: String,
+    host: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 pub struct EndpointInfo {
     pub url: String,
     pub token: String,
 }
 
-/// Start the MCP server on a localhost-only port. Persists the per-install
+/// Start the MCP server on a localhost-only port. Persists the per-launch
 /// token and the current endpoint to `<data dir>/mcp.json` so the stdio shim
 /// can find the running app.
 pub async fn start(editor: Editor) -> Result<EndpointInfo> {
@@ -34,15 +37,8 @@ pub async fn start(editor: Editor) -> Result<EndpointInfo> {
 /// file. Tests use that, so a test server never overwrites the real app's
 /// `mcp.json` (which would leave the shim pointing at a dead endpoint).
 pub async fn start_with(editor: Editor, discovery_file: Option<&std::path::Path>) -> Result<EndpointInfo> {
-    let token = match editor.store().get_kv("mcp_token")? {
-        Some(t) => t,
-        None => {
-            let t: String =
-                rand::thread_rng().sample_iter(&Alphanumeric).take(40).map(char::from).collect();
-            editor.store().set_kv("mcp_token", &t)?;
-            t
-        }
-    };
+    let token: String =
+        rand::thread_rng().sample_iter(&Alphanumeric).take(40).map(char::from).collect();
 
     // Stable port across launches: reuse the persisted one when free, fall
     // back to a fresh ephemeral port only if something else grabbed it.
@@ -58,16 +54,17 @@ pub async fn start_with(editor: Editor, discovery_file: Option<&std::path::Path>
     let port = listener.local_addr()?.port();
     editor.store().set_kv("mcp_port", &port.to_string())?;
 
-    let state = McpState { editor, token: token.clone() };
-    let app = Router::new().route("/mcp", post(handle)).with_state(state);
-    let url = format!("http://127.0.0.1:{port}/mcp");
+    let host = format!("127.0.0.1:{port}");
+    let url = format!("http://{host}/mcp");
+    let state = McpState { editor, token: token.clone(), host };
+    let app = Router::new()
+        .route("/mcp", post(handle))
+        .layer(DefaultBodyLimit::max(256 * 1024))
+        .with_state(state);
 
     let info = EndpointInfo { url: url.clone(), token: token.clone() };
     if let Some(endpoint_file) = discovery_file {
-        if let Some(parent) = endpoint_file.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(endpoint_file, serde_json::to_string_pretty(&json!(&info))?)?;
+        write_discovery(endpoint_file, &info)?;
     }
 
     tokio::spawn(async move {
@@ -79,6 +76,38 @@ pub async fn start_with(editor: Editor, discovery_file: Option<&std::path::Path>
         }
     });
     Ok(info)
+}
+
+fn write_discovery(path: &Path, info: &EndpointInfo) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        crate::error::CoreError::InvalidArg("MCP discovery file needs a private directory".into())
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let created = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent);
+        created?;
+        let metadata = std::fs::symlink_metadata(parent)?;
+        if !metadata.is_dir() || metadata.permissions().mode() & 0o777 != 0o700 {
+            return Err(crate::error::CoreError::Unavailable(
+                "MCP discovery directory must have permissions 0700".into(),
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    return Err(crate::error::CoreError::Unavailable(
+        "Private MCP discovery is currently supported on Unix only".into(),
+    ));
+
+    #[cfg(unix)]
+    {
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
+        serde_json::to_writer(file.as_file_mut(), info)?;
+        file.flush()?;
+        file.as_file().sync_all()?;
+        file.persist(path).map_err(|error| error.error)?;
+        Ok(())
+    }
 }
 
 fn authorized(headers: &HeaderMap, token: &str) -> bool {
@@ -94,6 +123,11 @@ async fn handle(
     headers: HeaderMap,
     Json(req): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
+    if headers.contains_key("origin")
+        || headers.get("host").and_then(|value| value.to_str().ok()) != Some(state.host.as_str())
+    {
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": "native loopback clients only" })));
+    }
     if !authorized(&headers, &state.token) {
         return (
             StatusCode::UNAUTHORIZED,

@@ -1,0 +1,68 @@
+PRODUCT REQUIREMENTS: LOCAL-FIRST TRANSCRIPT EDITOR
+Owner: Independent open-source project (working name: Resolve Transcript Editor)
+Priority: P0 for basic transcript-to-Resolve editing
+Status: proposed
+
+PROBLEM
+Dialogue editors waste time finding, listening to, cutting, ripple-editing, and reviewing filler words, false starts, off-topic material, or profanity. Resolve's native features vary by edition/version and may not provide the desired bulk review and custom word rules. A stand-alone editor that delivers a clean, editable Resolve timeline is a practical first product.
+
+USER
+Primary: solo filmmaker, documentary editor, YouTuber, podcaster, interview editor.
+Secondary: assistant editor processing long interviews and transcripts.
+
+CORE USER STORY
+I select a video, get an offline transcript with word timing, highlight or search speech, mark particular words/ranges for keep/cut, preview the edit, apply an explicit batch, and import a NEW correctly-linked, editable timeline into Resolve. I can undo and regenerate without modifying original media.
+
+EXACT MVP JOURNEY
+1. Launch local app. Setup tells me whether ffmpeg and local speech model are ready; missing items do not trigger silent downloads.
+2. Import a single dialogue-heavy source video with embedded or selected matching audio.
+3. App transcribes locally with time-aligned words and caches transcript.
+4. Editor shows waveform/player and transcript. Clicking a word seeks. Selecting text selects a time range.
+5. I can search for 'um', 'uh', 'you know', chosen profanity, exact words, or a phrase. Review list shows timestamps and nearby context.
+6. I choose individual matches, select all of a category, exclude exceptions, and preview the resulting removal.
+7. I commit selected cuts as one undoable edit batch. Source file never changes.
+8. I export a Resolve-compatible XML into an approved project output path, then use a Resolve Scripts-menu command to import into a NEW timeline.
+9. I inspect/edit that timeline natively in Resolve. No direct destructive edits of an existing timeline.
+
+FUNCTIONAL REQUIREMENTS
+FR-01 Import supported media safely. Reject non-existent, unreadable, or mismatched files without changing anything.
+FR-02 Local transcription and word timestamps. Transcript remains readable with no network.
+FR-03 Speech-to-timeline map persists across restarts and undo/redo.
+FR-04 Search/filter by token, phrase, category, speaker if known, and time range.
+FR-05 Highlight text with separate states: highlighted, proposed cut, applied cut, protected/keep.
+FR-06 Preview original vs proposed cut; no actions happen from a mere selection.
+FR-07 Bulk select / deselect and show count, duration removed, nearby context.
+FR-08 Save and restore edit plan, with versioned project metadata.
+FR-09 Export Resolve XML with matching source video/audio and timecode.
+FR-10 Import to NEW Resolve timeline, never overwrite one without user approval.
+FR-11 No cloud by default. Network paths explicit and auditable.
+FR-12 Return actionable errors. No silent fallback to fake/demo output in production.
+
+NON-FUNCTIONAL REQUIREMENTS
+Target: macOS first, Apple Silicon first; test Intel Mac separately if claimed.
+Resolve: validate free and Studio separately on the exact installed version. Never assume Workflow Integrations work on free.
+Accuracy: frame-bounded cuts; duration discrepancy <= one frame after import for supported fixtures.
+Reliability: restart does not lose transcript/edit plan; retries do not double-apply cuts.
+Performance: baseline measured for 5, 30, and 60 minute videos; set launch thresholds from measurement, not guesses.
+Privacy: local unless user explicitly enables a hosted mode. Hosted model receives text only after clear notice.
+Accessibility: keyboard navigation, visible focus, readable labels, zoom, high contrast.
+
+NON-GOALS FOR MVP
+Preserving arbitrary grade/Fusion/effects on an existing Resolve sequence.
+Multicam, compound clips, nested sequences, external audio sync, multi-track B-roll, speed ramps, collaboration, cloud sharing.
+Automated AI storytelling that edits without a review step.
+Rendering or distributing a signed installer before security and license gates.
+
+SUCCESS METRICS
+- 100% of import tests leave the original source bytes unchanged.
+- All scripted cut/keep cases produce expected included ranges.
+- No missing linked media after Resolve import for supported fixtures.
+- No unexpected non-loopback requests during local-only edit session.
+- 0 high/critical findings remaining in defined release scope.
+- Users complete import, edit, review, Resolve handoff without using Terminal.
+
+OPEN DECISIONS, WITH DEFAULTS
+Brand: retain upstream credits, use a distinct independent fork/app identity when distributing.
+Default workflow: standalone app + Resolve Scripts-menu bridge.
+Audio: one embedded source audio stream for P0; reject ambiguity rather than guessing.
+AI: optional and disabled for automatic destructive editing.

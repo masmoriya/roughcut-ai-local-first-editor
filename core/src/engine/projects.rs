@@ -8,14 +8,33 @@ use crate::model::*;
 use chrono::Utc;
 use uuid::Uuid;
 
+fn normalize_phrase_list(entries: &mut Vec<String>) -> Result<()> {
+    if entries.len() > 200 || entries.iter().map(|entry| entry.chars().count()).sum::<usize>() > 4000
+        || entries.iter().any(|entry| entry.chars().any(char::is_control))
+    {
+        return Err(CoreError::InvalidArg("Phrase lists support up to 200 phrases and 4,000 characters, with one phrase per line".into()));
+    }
+    let mut seen = std::collections::HashSet::new();
+    entries.retain_mut(|entry| {
+        *entry = entry.trim().to_owned();
+        !entry.is_empty() && seen.insert(entry.clone())
+    });
+    Ok(())
+}
+
 impl Editor {
     pub async fn create_project(&self, name: &str, file_path: Option<&str>) -> Result<Project> {
         let mut project = Project::new(name);
         if let Some(path) = file_path {
-            let media = self.inner.video.probe(path).await?;
+            let (media, identity) = self.probe_attached_media(path).await?;
+            project.media_fingerprint = identity.as_ref().map(super::media::SourceIdentity::fingerprint).transpose()?;
             project.timeline = Timeline::new(media.duration);
             project.media = Some(media);
         }
+        self.insert_project(project)
+    }
+
+    pub(super) fn insert_project(&self, project: Project) -> Result<Project> {
         self.inner.store.save_project(&project)?;
         {
             let mut state = self.inner.state.lock().unwrap();
@@ -31,25 +50,29 @@ impl Editor {
     /// Save-as: clone media + current cut state under a new name with a fresh
     /// undo history. The original project is untouched.
     pub fn duplicate_project(&self, project_id: Uuid, name: &str) -> Result<Project> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(CoreError::InvalidArg("Enter a name for the project copy".into()));
+        }
         self.ensure_loaded(project_id)?;
-        let (source, transcript) = {
+        let (mut copy, transcript) = {
             let state = self.inner.state.lock().unwrap();
             let entry =
                 state.get(&project_id).ok_or_else(|| CoreError::NotFound("project".into()))?;
-            (
-                entry.project.clone().ok_or_else(|| CoreError::NotFound("project".into()))?,
-                entry.transcript.clone(),
-            )
+            let source = entry.project.as_ref().ok_or_else(|| CoreError::NotFound("project".into()))?;
+            if source.deleted_at.is_some() {
+                return Err(CoreError::InvalidArg("Restore the project from trash before duplicating it".into()));
+            }
+            if source.clip_session.is_some() {
+                return Err(CoreError::InvalidArg("Save or cancel the clip edit before duplicating the project".into()));
+            }
+            (source.clone(), entry.transcript.clone())
         };
-        let mut copy = source;
         copy.id = Uuid::new_v4();
         copy.name = name.to_string();
         copy.created_at = Utc::now();
         copy.updated_at = Utc::now();
-        self.inner.store.save_project(&copy)?;
-        if let Some(t) = &transcript {
-            self.inner.store.save_transcript(copy.id, t)?;
-        }
+        self.inner.store.save_edit(&copy, transcript.as_ref(), r#"{"undo":[],"redo":[]}"#, None)?;
         {
             let mut state = self.inner.state.lock().unwrap();
             state.insert(
@@ -69,7 +92,9 @@ impl Editor {
         self.ensure_loaded(project_id)?;
         // Old projects (transcribed before indexing existed) gain a semantic
         // index in the background the first time they're opened.
-        self.backfill_index_if_missing(project_id);
+        if self.inference_enabled() {
+            self.backfill_index_if_missing(project_id);
+        }
         self.with_project(project_id, |p, _| Ok(p.clone()))
     }
 
@@ -155,21 +180,26 @@ impl Editor {
         &self,
         project_id: Uuid,
     ) -> Result<crate::adapters::video::MediaAssets> {
-        use crate::adapters::video::{ensure_playable_copy, playable_copy_failure, playable_copy_path};
-        let media = self
-            .with_project(project_id, |p, _| Ok(p.media.clone()))?
-            .ok_or_else(|| CoreError::InvalidArg("project has no media".into()))?;
+        use crate::adapters::video::{ensure_playable_stream, playable_stream_failure, playable_stream_path};
+        let (media, stream) = self.with_project(project_id, |p, transcript| {
+            let media = p.media.clone().ok_or_else(|| CoreError::InvalidArg("project has no media".into()))?;
+            super::media::validate_project_source(p)?;
+            let stream = transcript.and_then(|value| value.source_audio_stream_index)
+                .or_else(|| p.resolve_timeline.as_ref().map(|binding| binding.dialogue_stream_index))
+                .filter(|_| media.source_audio_tracks.is_some_and(|tracks| tracks > 1));
+            Ok((media, stream))
+        })?;
         // Only when there's neither a copy nor a recorded failure: otherwise
         // the event below would trigger a refetch that lands here again.
         if !self.demo_mode()
-            && playable_copy_path(&media).is_none()
-            && playable_copy_failure(&media).is_none()
+            && playable_stream_path(&media, stream).is_none()
+            && playable_stream_failure(&media, stream).is_none()
         {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let editor = self.clone();
                 let media = media.clone();
                 handle.spawn(async move {
-                    match ensure_playable_copy(&media).await {
+                    match ensure_playable_stream(&media, stream).await {
                         Ok(Some(_)) | Err(_) => {
                             send(&editor.inner.sink, CoreEvent::MediaAssetsChanged { project_id })
                         }
@@ -178,13 +208,27 @@ impl Editor {
                 });
             }
         }
-        self.inner.video.media_assets(&media).await
+        self.inner.video.media_assets(&media, stream).await
     }
 
     pub fn get_transcript(&self, project_id: Uuid) -> Result<Option<Transcript>> {
-        self.ensure_loaded(project_id)?;
-        let state = self.inner.state.lock().unwrap();
-        Ok(state.get(&project_id).and_then(|e| e.transcript.clone()))
+        self.with_project(project_id, |project, transcript| {
+            if let Some(transcript) = transcript {
+                super::media::validate_transcript_source(transcript, project.media.as_ref())?;
+            }
+            Ok(transcript.cloned())
+        })
+    }
+
+    /// Capture matching project and transcript revisions under one state lock.
+    pub fn snapshot(&self, project_id: Uuid) -> Result<(Project, Option<Transcript>)> {
+        self.with_project(project_id, |project, transcript| {
+            super::media::validate_project_source(project)?;
+            if let Some(transcript) = transcript {
+                super::media::validate_transcript_source(transcript, project.media.as_ref())?;
+            }
+            Ok((project.clone(), transcript.cloned()))
+        })
     }
 
     pub fn get_preferences(&self) -> Result<Preferences> {
@@ -192,6 +236,7 @@ impl Editor {
     }
 
     pub fn set_preferences(&self, prefs: Preferences) -> Result<Preferences> {
+        let _write = self.inner.prefs_write.lock().unwrap();
         self.inner.store.save_preferences(&prefs)?;
         Ok(prefs)
     }
@@ -206,11 +251,30 @@ impl Editor {
         patch: &serde_json::Value,
         source: ActionSource,
     ) -> Result<Preferences> {
+        self.update_preferences_checked(patch, source, None)
+    }
+
+    pub(crate) fn update_preferences_checked(
+        &self,
+        patch: &serde_json::Value,
+        source: ActionSource,
+        expected_rule_sets: Option<&serde_json::Value>,
+    ) -> Result<Preferences> {
         let patch = patch
             .as_object()
             .ok_or_else(|| CoreError::InvalidArg("preferences must be an object".into()))?;
+        if !self.inference_enabled() && ["inference_endpoint", "inference_model", "embedding_model", "model_tier"]
+            .iter().any(|key| patch.contains_key(*key))
+        {
+            return Err(CoreError::Unavailable("Model settings are disabled in this editor".into()));
+        }
         let _write = self.inner.prefs_write.lock().unwrap();
         let current = self.get_preferences()?;
+        if patch.contains_key("saved_rule_sets")
+            && expected_rule_sets != Some(&serde_json::to_value(&current.saved_rule_sets)?)
+        {
+            return Err(CoreError::Unavailable("Saved rule sets changed. Reload the list and try again.".into()));
+        }
         let serde_json::Value::Object(mut merged) = serde_json::to_value(&current)? else {
             return Err(CoreError::Other("preferences did not serialize to an object".into()));
         };
@@ -226,7 +290,35 @@ impl Editor {
             )));
         }
         merge_into(&mut merged, patch);
-        let next: Preferences = serde_json::from_value(serde_json::Value::Object(merged))?;
+        let mut next: Preferences = serde_json::from_value(serde_json::Value::Object(merged))?;
+        for (key, entries) in [
+            ("custom_filler_words", &mut next.custom_filler_words),
+            ("profanity_phrases", &mut next.profanity_phrases),
+            ("keyword_phrases", &mut next.keyword_phrases),
+            ("never_cut_phrases", &mut next.never_cut_phrases),
+        ] {
+            if !patch.contains_key(key) { continue; }
+            normalize_phrase_list(entries)?;
+        }
+        if patch.contains_key("saved_rule_sets") {
+            if source != ActionSource::Ui || next.saved_rule_sets.len() > 16 {
+                return Err(CoreError::InvalidArg("Save up to 16 rule sets in the editor".into()));
+            }
+            let mut names = std::collections::HashSet::new();
+            for set in &mut next.saved_rule_sets {
+                set.name = set.name.trim().to_owned();
+                if set.name.is_empty() || set.name.chars().count() > 80
+                    || set.name.chars().any(char::is_control) || !names.insert(set.name.to_lowercase())
+                {
+                    return Err(CoreError::InvalidArg("Each rule set needs a unique name of up to 80 characters".into()));
+                }
+                for list in [&mut set.custom_filler_words, &mut set.profanity_phrases,
+                    &mut set.keyword_phrases, &mut set.never_cut_phrases]
+                {
+                    normalize_phrase_list(list)?;
+                }
+            }
+        }
         // The model switch, its model and the consent are the user's, set in
         // the app (shell commands), never through this tool by any caller.
         if next.model_mode != current.model_mode
@@ -249,7 +341,8 @@ impl Editor {
                 next.inference_endpoint
             )));
         }
-        self.set_preferences(next)
+        self.inner.store.save_preferences(&next)?;
+        Ok(next)
     }
 
     /// Presentation layout — project metadata, persisted, not journaled.
@@ -271,6 +364,7 @@ impl Editor {
 
     /// A/V sync nudge — project metadata, persisted, not journaled.
     pub fn set_audio_offset(&self, project_id: uuid::Uuid, offset_s: f64) -> crate::error::Result<()> {
+        self.require_single_file_project(project_id)?;
         self.ensure_loaded(project_id)?;
         let mut state = self.inner.state.lock().unwrap();
         let entry = state
@@ -313,6 +407,39 @@ fn is_loopback_url(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rule_sets_survive_reopen_and_reject_stale_updates() {
+        use crate::{events::NullSink, store::SqliteStore};
+        use std::sync::Arc;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("library.db");
+        let open = || Editor::bootstrap_with_store(
+            Box::new(SqliteStore::open(&path).unwrap()),
+            Arc::new(NullSink),
+        ).unwrap();
+        let editor = open();
+        let initial = serde_json::json!([]);
+        let patch = serde_json::json!({"saved_rule_sets": [{
+            "name": " Interview ",
+            "custom_filler_words": [" um ", "um"],
+            "profanity_phrases": [],
+            "keyword_phrases": [],
+            "never_cut_phrases": ["you know"],
+        }]});
+        editor.update_preferences_checked(&patch, ActionSource::Ui, Some(&initial)).unwrap();
+        assert!(editor.update_preferences_checked(
+            &serde_json::json!({"saved_rule_sets": []}), ActionSource::Ui, Some(&initial),
+        ).is_err());
+        drop(editor);
+
+        let restored = open().get_preferences().unwrap().saved_rule_sets;
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].name, "Interview");
+        assert_eq!(restored[0].custom_filler_words, vec![String::from("um")]);
+        assert_eq!(restored[0].never_cut_phrases, vec![String::from("you know")]);
+    }
 
     #[test]
     fn loopback_urls() {

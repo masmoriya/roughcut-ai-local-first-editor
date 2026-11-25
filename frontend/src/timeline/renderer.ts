@@ -101,44 +101,6 @@ export function hitTestClipEdge(rects: ClipRect[], x: number): EdgeHit {
 }
 
 // ---------------------------------------------------------------------------
-// Fallback waveform: deterministic pseudo-random peaks per clip id, drawn only
-// while the real peaks (from get_media_assets, loaded as binary over the asset
-// protocol in assets.ts, never JSON IPC) aren't available.
-// ---------------------------------------------------------------------------
-
-const peakCache = new Map<string, number[]>();
-
-export function waveformPeaks(clipId: string, count: number): number[] {
-  const key = `${clipId}:${count}`;
-  const cached = peakCache.get(key);
-  if (cached) return cached;
-
-  let seed = 2166136261;
-  for (let i = 0; i < clipId.length; i++) {
-    seed ^= clipId.charCodeAt(i);
-    seed = Math.imul(seed, 16777619);
-  }
-  let a = seed >>> 0;
-  const rand = () => {
-    a |= 0; a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-
-  const peaks: number[] = [];
-  let env = 0.35 + rand() * 0.3;
-  for (let i = 0; i < count; i++) {
-    env += (rand() - 0.5) * 0.22;
-    env = Math.min(0.95, Math.max(0.08, env));
-    const spike = rand() < 0.06 ? rand() * 0.35 : 0;
-    peaks.push(Math.min(1, env + spike));
-  }
-  peakCache.set(key, peaks);
-  return peaks;
-}
-
-// ---------------------------------------------------------------------------
 // Drawing
 // ---------------------------------------------------------------------------
 
@@ -160,7 +122,7 @@ export interface DrawState {
   selectedClipId: string | null;
   hoverEdge: EdgeHit;
   drag: DragPreview | null;
-  /** Real peaks/thumbnails when loaded; null = synthetic waveform fallback. */
+  /** Source peaks and thumbnails when available. */
   assets: TimelineAssets | null;
   /** Proposed cuts (not made yet), source seconds; `focused` is the one the
    *  review bar is on. */
@@ -361,28 +323,24 @@ export function drawTimeline(ctx: CanvasRenderingContext2D, s: DrawState): void 
       }
     }
 
-    // waveform: real peaks mapped by source time, synthetic fallback otherwise
+    // Waveform peaks are mapped by source time.
     const barW = 2;
     const gap = 1;
     const n = Math.max(4, Math.floor(r.w / (barW + gap)));
     const waveH = hasThumbs ? trackH * 0.36 : trackH * 0.62;
     const baseY = TRACK_TOP + trackH - 4;
     ctx.fillStyle = excluded ? theme().waveDim : theme().wave;
-    const fallback = hasPeaks ? null : waveformPeaks(r.clip.id, 96);
-    for (let i = 0; i < n; i++) {
-      let p: number;
-      if (hasPeaks) {
+    if (hasPeaks) {
+      for (let i = 0; i < n; i++) {
         const srcT = r.clip.source_in + ((i + 0.5) / n) * clipDur;
         const idx = Math.min(
           s.assets!.peaks!.length - 1,
           Math.max(0, Math.floor(srcT * s.assets!.pps)),
         );
-        p = (s.assets!.peaks![idx] ?? 0) / 255;
-      } else {
-        p = fallback![Math.floor((i / n) * fallback!.length)] ?? 0.3;
+        const amplitude = (s.assets!.peaks![idx] ?? 0) / 255;
+        const height = Math.max(2, amplitude * waveH);
+        ctx.fillRect(r.x + 2 + i * (barW + gap), baseY - height, barW, height);
       }
-      const bh = Math.max(2, p * waveH);
-      ctx.fillRect(r.x + 2 + i * (barW + gap), baseY - bh, barW, bh);
     }
     ctx.restore();
 

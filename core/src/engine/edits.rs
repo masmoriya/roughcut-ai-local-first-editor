@@ -39,16 +39,114 @@ impl Editor {
         source: ActionSource,
         label: Option<String>,
     ) -> Result<EditOutcome> {
+        self.commit_edit(project_id, op, source, label, None, None)
+    }
+
+    pub(crate) fn commit_edit(
+        &self, project_id: Uuid, op: EditOp, source: ActionSource, label: Option<String>,
+        proposal_id: Option<Uuid>, expected_transcript: Option<Uuid>,
+    ) -> Result<EditOutcome> {
         self.ensure_loaded(project_id)?;
         let prefs = self.inner.store.load_preferences()?;
         let outcome = {
             let mut state = self.inner.state.lock().unwrap();
             let entry =
                 state.get_mut(&project_id).ok_or_else(|| CoreError::NotFound("project".into()))?;
-            let ProjectState { project, transcript, undo, redo } = entry;
+            if let Some(id) = expected_transcript {
+                let transcript = entry.transcript.as_ref().filter(|value| value.id == id)
+                    .ok_or_else(|| CoreError::Unavailable("The transcript changed. Select the passage again before editing.".into()))?;
+                let project = entry.project.as_ref().ok_or_else(|| CoreError::NotFound("project".into()))?;
+                super::media::validate_project_source(project)?;
+                super::media::validate_transcript_source(transcript, project.media.as_ref())?;
+            }
+            let mut staged = entry.clone();
+            let ProjectState { project, transcript, undo, redo } = &mut staged;
             let project =
                 project.as_mut().ok_or_else(|| CoreError::NotFound("project".into()))?;
+            let mut rule_dictionary_fingerprint = None;
+            let mut cut_review = None;
+            if let Some(expected) = proposal_id {
+                super::media::validate_project_source(project)?;
+                let proposal = project.cut_proposal.as_ref().filter(|proposal| proposal.id == expected)
+                    .ok_or_else(|| CoreError::Unavailable("The cut proposal changed. Review it again before applying.".into()))?;
+                if let Some(expected) = &proposal.timeline_fingerprint {
+                    if super::proposals::proposal_timeline_fingerprint(project)? != *expected {
+                        return Err(CoreError::Unavailable("The timeline changed. Discard the old proposal and review the current timeline.".into()));
+                    }
+                }
+                if proposal.transcript_id.is_some_and(|id| transcript.as_ref().map(|value| value.id) != Some(id)) {
+                    return Err(CoreError::Unavailable("The transcript changed. Discard the old proposal and review the current transcript.".into()));
+                }
+                if let Some(transcript) = transcript.as_ref() {
+                    super::media::validate_transcript_source(transcript, project.media.as_ref())?;
+                }
+                let checkpoint_name = format!("Before {}", proposal.title);
+                rule_dictionary_fingerprint = proposal.rule_dictionary_fingerprint.clone();
+                if let EditOp::CutRanges { ranges } = &op {
+                    let approved: std::collections::HashSet<_> = ranges.iter()
+                        .map(|range| (range.start.to_bits(), range.end.to_bits())).collect();
+                    let fps = project.fps();
+                    let mut words: Vec<_> = transcript.iter().flat_map(|value| &value.segments)
+                        .filter(|segment| !segment.is_silence)
+                        .flat_map(|segment| segment.words.iter().enumerate().map(move |(index, word)| {
+                            ((word.start + word.end) / 2.0, segment.id, index, word.text.as_str(), word.confidence)
+                        }))
+                        .filter(|(time, _, _, _, _)| time.is_finite())
+                        .collect();
+                    words.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    // Cue-timed transcripts have text but no individual word IDs.
+                    let mut context_words = words.clone();
+                    context_words.extend(transcript.iter().flat_map(|value| &value.segments)
+                        .filter(|segment| !segment.is_silence && segment.words.is_empty())
+                        .filter_map(|segment| {
+                            let time = (segment.start + segment.end) / 2.0;
+                            time.is_finite().then_some((time, segment.id, 0, segment.text.as_str(), 0.0))
+                        }));
+                    context_words.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    cut_review = Some(crate::model::CutReviewReceipt {
+                        proposal_id: proposal.id,
+                        proposal_title: proposal.title.clone(),
+                        transcript_id: proposal.transcript_id,
+                        decisions: proposal.cuts.iter().map(|cut| crate::model::CutReviewDecision {
+                            cut_id: cut.id,
+                            phrase_matches: cut.phrase_matches.iter().cloned().map(|mut matched| {
+                                let start = matched.source_in_frame as f64 / fps;
+                                let end = matched.source_out_frame as f64 / fps;
+                                let first = words.partition_point(|word| word.0 < start);
+                                let last = words.partition_point(|word| word.0 < end);
+                                let matched_words = words.get(first..last).unwrap_or_default();
+                                matched.word_ids = matched_words.iter().map(|(_, segment, index, _, _)| format!("{segment}:{index}")).collect();
+                                matched.min_word_confidence = matched_words.iter().map(|word| word.4)
+                                    .filter(|score| score.is_finite() && *score > 0.0).reduce(f64::min);
+                                matched.context_before = review_context(&context_words, start - 3.0, start, true);
+                                matched.context_after = review_context(&context_words, end, end + 3.0, false);
+                                matched
+                            }).collect(),
+                            source_cut_id: proposal.transcript_id.map(|transcript_id| {
+                                let start = crate::time::to_frame(cut.start, fps);
+                                let end = crate::time::to_frame(cut.end, fps);
+                                let category = cut.rule_category.as_deref().unwrap_or(&cut.kind);
+                                format!("{transcript_id}:{start}:{end}:{category}")
+                            }),
+                            kind: cut.kind.clone(),
+                            rule_category: cut.rule_category.clone(),
+                            min_word_confidence: cut.min_word_confidence,
+                            source_in_frame: crate::time::to_frame(cut.start, fps),
+                            source_out_frame: crate::time::to_frame(cut.end, fps),
+                            word_ids: words.get(words.partition_point(|word| word.0 < cut.start)
+                                ..words.partition_point(|word| word.0 < cut.end)).unwrap_or_default()
+                                .iter().map(|(_, segment, index, _, _)| format!("{segment}:{index}")).collect(),
+                            context_before: review_context(&context_words, cut.start - 3.0, cut.start, true),
+                            context_after: review_context(&context_words, cut.end, cut.end + 3.0, false),
+                            approved: !cut.skipped && approved.contains(&(cut.start.to_bits(), cut.end.to_bits())),
+                        }).collect(),
+                    });
+                }
+                project.cut_proposal = None;
+                Self::record_checkpoint(project, &checkpoint_name, true);
+            }
             let op = normalize_op(op, project.fps());
+            let included_before = project.timeline.included_duration();
             let before_clips = project.timeline.clips.clone();
             let before_padding = project.timeline.global_padding;
             let mut split_ids = vec![];
@@ -62,8 +160,14 @@ impl Editor {
                 self.inner.rough_cut_peaks.lock().unwrap().take().as_deref(),
             )?;
             project.timeline.normalize();
+            let removed_duration = (included_before - project.timeline.included_duration()).max(0.0);
+            if proposal_id.is_some() && removed_duration <= f64::EPSILON {
+                return Err(CoreError::InvalidArg("These cuts no longer remove any footage. Discard the review or select different cuts.".into()));
+            }
             project.updated_at = Utc::now();
             let mut action = EditAction::new(source, op);
+            action.rule_dictionary_fingerprint = rule_dictionary_fingerprint;
+            action.cut_review = cut_review;
             if let Some(l) = label {
                 action.description = l;
             }
@@ -79,11 +183,7 @@ impl Editor {
                 undo.remove(0);
             }
             redo.clear();
-            self.inner.store.save_project(project)?;
-            if let Some(t) = transcript.as_ref() {
-                self.inner.store.save_transcript(project_id, t)?;
-            }
-            self.persist_journal(project_id, undo, redo)?;
+            self.save_edit_state(project, transcript.as_ref(), undo, redo)?;
             let split_clips = project
                 .timeline
                 .clips
@@ -91,15 +191,22 @@ impl Editor {
                 .filter(|c| split_ids.contains(&c.id))
                 .cloned()
                 .collect();
-            EditOutcome { action, timeline: project.timeline.clone(), split_clips }
+            let outcome = EditOutcome { action, timeline: project.timeline.clone(), removed_duration, split_clips };
+            *entry = staged;
+            outcome
         };
         send(&self.inner.sink, CoreEvent::TimelineChanged { project_id });
+        if proposal_id.is_some() {
+            send(&self.inner.sink, CoreEvent::CutProposalChanged { project_id });
+        }
         Ok(outcome)
     }
 
-    pub(super) fn persist_journal(&self, project_id: Uuid, undo: &[JournalEntry], redo: &[JournalEntry]) -> Result<()> {
-        let doc = serde_json::json!({ "undo": undo, "redo": redo }).to_string();
-        self.inner.store.set_kv(&format!("journal:{project_id}"), &doc)
+    fn save_edit_state(
+        &self, project: &Project, transcript: Option<&Transcript>, undo: &[JournalEntry], redo: &[JournalEntry],
+    ) -> Result<()> {
+        let journal = serde_json::json!({ "undo": undo, "redo": redo }).to_string();
+        self.inner.store.save_edit(project, transcript, &journal, None)
     }
 
     /// Detect fillers + repeated takes and PERSIST the flags — the same write
@@ -155,10 +262,25 @@ impl Editor {
         self.ensure_loaded(project_id)?;
         // Read inputs, then decode peaks OUTSIDE the state lock (slow).
         let (transcript, duration, media) = self.with_project(project_id, |p, t| {
+            super::media::validate_project_source(p)?;
             Ok((t.cloned(), p.timeline.duration, p.media.clone()))
         })?;
         let (Some(t), Some(media)) = (transcript, media) else { return Ok(vec![]) };
-        let Some(peaks) = crate::adapters::video::load_raw_peaks(&media).await else {
+        if media.source_audio_tracks.is_some_and(|tracks| tracks > 1) && t.source_audio_stream_index.is_none() {
+            return Err(CoreError::InvalidArg("This transcript has no selected dialogue track for pause review".into()));
+        }
+        super::media::validate_transcript_source(&t, Some(&media))?;
+        let peaks = crate::adapters::video::load_stream_peaks(&media, t.source_audio_stream_index).await;
+        self.with_project(project_id, |project, current| {
+            let unchanged = current.is_some_and(|current| current.id == t.id)
+                && project.media.as_ref().is_some_and(|current| current.id == media.id && current.file_path == media.file_path);
+            if !unchanged {
+                return Err(CoreError::Unavailable("The source or transcript changed while checking audio. Run pause review again.".into()));
+            }
+            super::media::validate_project_source(project)?;
+            super::media::validate_transcript_source(&t, project.media.as_ref())
+        })?;
+        let Some(peaks) = peaks else {
             return Ok(vec![]); // no audio energy to confirm against — refuse to guess
         };
         let prefs = self.inner.store.load_preferences()?;
@@ -192,6 +314,9 @@ impl Editor {
         use crate::events::ProgressTask;
         self.ensure_loaded(project_id)?;
         if self.get_transcript(project_id)?.is_none() {
+            if !self.inference_enabled() {
+                return Err(CoreError::InvalidArg("Import a timed transcript before reviewing pauses and fillers".into()));
+            }
             self.transcribe(project_id, None).await?;
         }
         let step = |fraction: f64, message: &str| {
@@ -209,11 +334,23 @@ impl Editor {
         // Hybrid silences: real audio energy (best effort — no ffmpeg means
         // transcript-only detection).
         step(0.2, "reading the audio");
-        let media = self.with_project(project_id, |p, _| Ok(p.media.clone()))?;
+        let (media, stream, has_word_timings) = self.with_project(project_id, |p, transcript| {
+            super::media::validate_project_source(p)?;
+            Ok((p.media.clone(), transcript.and_then(|value| value.source_audio_stream_index),
+                transcript.is_some_and(|value| value.segments.iter().any(|segment| !segment.words.is_empty()))))
+        })?;
         let peaks = match media {
-            Some(media) => crate::adapters::video::load_raw_peaks(&media).await,
+            Some(media) if media.source_audio_tracks.is_some_and(|tracks| tracks > 1) && stream.is_none() => {
+                return Err(CoreError::InvalidArg("This transcript has no selected dialogue track for pause and filler review".into()));
+            }
+            Some(media) => crate::adapters::video::load_stream_peaks(&media, stream).await,
             None => None,
         };
+        if !has_word_timings && !self.inference_enabled()
+            && peaks.as_deref().and_then(detect::levels).is_none()
+        {
+            return Err(CoreError::Unavailable("Pause review needs usable audio levels for a caption-only transcript".into()));
+        }
         step(0.6, "finding pauses and checking each cut against the audio");
         let title = match aggr {
             Aggressiveness::Natural => "Rough cut",
@@ -231,11 +368,12 @@ impl Editor {
         // repetition), stashed on the project. Embeddings are best-effort
         // (no index → takes only).
         step(0.85, "looking for repeated takes");
-        let embeddings = self
-            .inner
-            .store
-            .load_embeddings(project_id)?
-            .map(|(_, v)| v.into_iter().collect::<std::collections::HashMap<_, _>>());
+        let embeddings = if self.inference_enabled() {
+            self.inner.store.load_embeddings(project_id)?
+                .map(|(_, v)| v.into_iter().collect::<std::collections::HashMap<_, _>>())
+        } else {
+            None
+        };
         let suggestions = match self.get_transcript(project_id)? {
             Some(t) => detect::suggest_cuts(&t, embeddings.as_ref()),
             None => vec![],
@@ -274,6 +412,21 @@ impl Editor {
 
     /// Accept one suggestion: apply it as a normal undoable cut, then drop it
     /// from the list. Returns the edit action.
+    pub(crate) fn review_saved_suggestions(&self, project_id: Uuid, suggestion_id: Option<Uuid>) -> Result<super::proposals::ProposeOutcome> {
+        let (transcript_id, segment_ids) = self.with_project(project_id, |project, transcript| {
+            let transcript = transcript.ok_or_else(|| CoreError::Unavailable("Import a timed transcript before reviewing suggestions.".into()))?;
+            let ids: Vec<_> = project.suggestions.iter()
+                .filter(|suggestion| suggestion_id.is_none_or(|id| suggestion.id == id))
+                .flat_map(|suggestion| suggestion.segment_ids.iter().copied()).collect();
+            Ok((transcript.id, live_segment_ids(&ids, Some(transcript))))
+        })?;
+        if segment_ids.is_empty() {
+            return Err(CoreError::Unavailable("No saved suggestions match this transcript.".into()));
+        }
+        self.propose_labeled_ops(project_id, vec![EditOp::CutSegments { segment_ids }],
+            ("Saved suggestions", None, Some(transcript_id)), &[], ActionSource::Ui, None, false)
+    }
+
     pub fn accept_suggestion(
         &self,
         project_id: Uuid,
@@ -393,13 +546,18 @@ impl Editor {
         name: &str,
         auto: bool,
     ) -> Result<crate::model::CheckpointSummary> {
-        use crate::model::Checkpoint;
         self.ensure_loaded(project_id)?;
         let mut state = self.inner.state.lock().unwrap();
         let p = state
             .get_mut(&project_id)
             .and_then(|e| e.project.as_mut())
             .ok_or_else(|| CoreError::NotFound("project".into()))?;
+        let summary = Self::record_checkpoint(p, name, auto);
+        self.inner.store.save_project(p)?;
+        Ok(summary)
+    }
+
+    fn record_checkpoint(p: &mut Project, name: &str, auto: bool) -> CheckpointSummary {
         let cp = Checkpoint {
             id: Uuid::new_v4(),
             name: if name.trim().is_empty() { "Checkpoint".into() } else { name.trim().into() },
@@ -420,8 +578,7 @@ impl Editor {
                 .unwrap_or(0);
             p.checkpoints.remove(idx);
         }
-        self.inner.store.save_project(p)?;
-        Ok(summary)
+        summary
     }
 
     /// Lean checkpoint list (no clip dumps).
@@ -475,13 +632,24 @@ impl Editor {
         let state = self.inner.state.lock().unwrap();
         let entry =
             state.get(&project_id).ok_or_else(|| CoreError::NotFound("project".into()))?;
-        let to_entry = |j: &JournalEntry, applied: bool| HistoryEntry {
-            id: j.action.id,
-            kind: j.action.kind.clone(),
-            source: j.action.source,
-            description: j.action.description.clone(),
-            timestamp: j.action.timestamp,
-            applied,
+        let to_entry = |j: &JournalEntry, applied: bool| {
+            let kept = j.action.cut_review.as_ref().map_or(0, |receipt| {
+                receipt.decisions.iter().filter(|decision| !decision.approved).count()
+            });
+            let description = if kept == 0 {
+                j.action.description.clone()
+            } else {
+                format!("{} · {kept} kept", j.action.description)
+            };
+            HistoryEntry {
+                id: j.action.id,
+                kind: j.action.kind.clone(),
+                source: j.action.source,
+                description,
+                timestamp: j.action.timestamp,
+                applied,
+                has_cut_review: j.action.cut_review.is_some(),
+            }
         };
         let mut entries: Vec<HistoryEntry> =
             entry.undo.iter().map(|j| to_entry(j, true)).collect();
@@ -489,6 +657,26 @@ impl Editor {
         // current point), so reversed gives true chronological future order.
         entries.extend(entry.redo.iter().rev().map(|j| to_entry(j, false)));
         Ok(History { current_index: entry.undo.len() as i64 - 1, entries })
+    }
+
+    pub fn history_cut_review(&self, project_id: Uuid, action_id: Uuid, offset: usize) -> Result<Option<serde_json::Value>> {
+        self.ensure_loaded(project_id)?;
+        let state = self.inner.state.lock().unwrap();
+        let entry = state.get(&project_id).ok_or_else(|| CoreError::NotFound("project".into()))?;
+        let journal = entry.undo.iter().chain(&entry.redo)
+            .find(|journal| journal.action.id == action_id)
+            .ok_or_else(|| CoreError::NotFound("history action".into()))?;
+        Ok(journal.action.cut_review.as_ref().map(|review| {
+            let offset = offset.min(review.decisions.len());
+            let end = offset.saturating_add(50).min(review.decisions.len());
+            serde_json::json!({
+                "proposal_id": review.proposal_id,
+                "proposal_title": review.proposal_title,
+                "transcript_id": review.transcript_id,
+                "total": review.decisions.len(),
+                "decisions": &review.decisions[offset..end],
+            })
+        }))
     }
 
     /// Jump to a point in history: undo/redo until `target` is the newest
@@ -586,28 +774,30 @@ impl Editor {
             let mut state = self.inner.state.lock().unwrap();
             let entry =
                 state.get_mut(&project_id).ok_or_else(|| CoreError::NotFound("project".into()))?;
-            let ProjectState { project, transcript, undo, redo } = entry;
+            let mut staged = entry.clone();
+            let ProjectState { project, transcript, undo, redo } = &mut staged;
             let project =
                 project.as_mut().ok_or_else(|| CoreError::NotFound("project".into()))?;
             let popped = if is_undo { undo.pop() } else { redo.pop() };
-            match popped {
+            let outcome = match popped {
                 Some(entry) => {
                     let replay = if is_undo { &entry.inverse } else { &entry.redo };
                     apply_op(project, transcript.as_mut(), replay, &prefs, &mut vec![], None)?;
                     project.timeline.normalize();
                     project.updated_at = Utc::now();
-                    self.inner.store.save_project(project)?;
                     let action = entry.action.clone();
                     if is_undo {
                         redo.push(entry);
                     } else {
                         undo.push(entry);
                     }
-                    self.persist_journal(project_id, undo, redo)?;
+                    self.save_edit_state(project, transcript.as_ref(), undo, redo)?;
                     (Some(action), project.timeline.clone())
                 }
                 None => (None, project.timeline.clone()),
-            }
+            };
+            *entry = staged;
+            outcome
         };
         send(&self.inner.sink, CoreEvent::TimelineChanged { project_id });
         Ok(result)
@@ -777,4 +967,45 @@ pub(super) fn apply_op(
         }
     }
     Ok(())
+}
+fn review_context(words: &[(f64, Uuid, usize, &str, f64)], start: f64, end: f64, before: bool) -> String {
+    let first = words.partition_point(|word| word.0 < start);
+    let last = words.partition_point(|word| word.0 < end);
+    let nearby = &words[first..last];
+    let context = nearby.iter().map(|word| word.3).collect::<Vec<_>>().join(" ");
+    if before {
+        let tail: Vec<_> = context.trim().chars().rev().take(100).collect();
+        tail.into_iter().rev().collect()
+    } else {
+        context.trim().chars().take(100).collect()
+    }
+}
+
+#[cfg(test)]
+mod saved_suggestion_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn saved_suggestion_review_leaves_timeline_unchanged_and_respects_protection() {
+        let editor = Editor::test_instance();
+        let project = editor.create_project("Saved suggestion review", Some("/demo/footage.mp4")).await.unwrap();
+        let transcript = editor.transcribe_audio_stream(project.id, None, None).await.unwrap();
+        let segment = transcript.segments.iter().find(|segment| !segment.is_silence && segment.end - segment.start > 0.5).unwrap();
+        let suggestion = crate::model::CutSuggestion {
+            id: Uuid::new_v4(), segment_ids: vec![segment.id], start: segment.start, end: segment.end,
+            reason: "repeated_take".into(), confidence: 1.0, duplicate_of: None, preview: segment.text.clone(),
+        };
+        let suggestion_id = suggestion.id;
+        editor.inner.state.lock().unwrap().get_mut(&project.id).unwrap()
+            .project.as_mut().unwrap().suggestions.push(suggestion);
+        let before = editor.get_timeline(project.id).unwrap();
+        assert!(!editor.review_saved_suggestions(project.id, Some(suggestion_id)).unwrap().added.is_empty());
+        let after = editor.get_timeline(project.id).unwrap();
+        assert_eq!(serde_json::to_value(after).unwrap(), serde_json::to_value(before).unwrap());
+        editor.discard_cut_proposal(project.id).unwrap();
+        editor.protect_source_ranges(project.id, vec![crate::model::SourceRange {
+            start: segment.start, end: segment.end,
+        }]).unwrap();
+        assert!(editor.review_saved_suggestions(project.id, Some(suggestion_id)).unwrap().added.is_empty());
+    }
 }

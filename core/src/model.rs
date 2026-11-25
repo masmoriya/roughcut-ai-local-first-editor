@@ -18,11 +18,35 @@ pub struct Media {
     pub file_path: String,
     pub duration: f64,
     pub frame_rate: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub average_frame_rate: Option<f64>,
     pub width: u32,
     pub height: u32,
     pub audio_sample_rate: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub source_audio_channels: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub source_audio_tracks: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub audio_streams: Vec<AudioStream>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub source_timecode: Option<String>,
     pub codec: String,
     pub imported_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioStream {
+    pub index: usize,
+    pub channels: Option<u32>,
+    #[serde(default)]
+    pub sample_rate: Option<u32>,
+    pub language: Option<String>,
 }
 
 // ------------------------------------------------------------ transcript
@@ -32,15 +56,30 @@ pub struct Media {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Word {
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub original_text: Option<String>,
     pub start: f64,
     pub end: f64,
     pub confidence: f64,
+}
+
+impl Word {
+    pub fn spoken_text(&self) -> &str {
+        self.original_text.as_deref().unwrap_or(&self.text)
+    }
 }
 
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-bindings", ts(export))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptSegment {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub original_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub speaker: Option<String>,
     pub id: Uuid,
     pub start: f64,
     pub end: f64,
@@ -61,6 +100,12 @@ pub struct Transcript {
     pub language: String,
     pub segments: Vec<TranscriptSegment>,
     pub model_used: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub source_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub source_audio_stream_index: Option<usize>,
     /// Word edges were trimmed to the audio (`detect::trim_words_to_audio`):
     /// on for transcripts made since, or fixed with `retime_words`.
     #[serde(default)]
@@ -535,6 +580,54 @@ impl EditOp {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CutReviewReceipt {
+    pub proposal_id: Uuid,
+    #[serde(default)]
+    pub proposal_title: String,
+    pub transcript_id: Option<Uuid>,
+    pub decisions: Vec<CutReviewDecision>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CutReviewDecision {
+    pub cut_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_cut_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phrase_matches: Vec<PhraseMatchIdentity>,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_word_confidence: Option<f64>,
+    pub source_in_frame: i64,
+    pub source_out_frame: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub word_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub context_before: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub context_after: String,
+    pub approved: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhraseMatchIdentity {
+    pub rule_id: String,
+    pub match_id: String,
+    pub source_in_frame: i64,
+    pub source_out_frame: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub word_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_word_confidence: Option<f64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub context_before: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub context_after: String,
+}
+
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-bindings", ts(export))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -544,6 +637,12 @@ pub struct EditAction {
     pub source: ActionSource,
     pub timestamp: DateTime<Utc>,
     pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub rule_dictionary_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub cut_review: Option<CutReviewReceipt>,
     /// What was requested, normalized (frame-snapped) — the audit record.
     /// (Exact inverse/redo snapshots live in the journal, NOT here — they are
     /// clip-array dumps that would bloat every tool response.)
@@ -558,6 +657,8 @@ impl EditAction {
             source,
             timestamp: Utc::now(),
             description: op.describe(),
+            rule_dictionary_fingerprint: None,
+            cut_review: None,
             op,
         }
     }
@@ -585,6 +686,15 @@ pub enum ModelTier {
     Large,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedRuleSet {
+    pub name: String,
+    pub custom_filler_words: Vec<String>,
+    pub profanity_phrases: Vec<String>,
+    pub keyword_phrases: Vec<String>,
+    pub never_cut_phrases: Vec<String>,
+}
+
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-bindings", ts(export))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -592,6 +702,18 @@ pub struct Preferences {
     pub default_padding: Padding,
     pub cut_aggressiveness: Aggressiveness,
     pub custom_filler_words: Vec<String>,
+    #[serde(default)]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub profanity_phrases: Vec<String>,
+    #[serde(default)]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub keyword_phrases: Vec<String>,
+    #[serde(default)]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub never_cut_phrases: Vec<String>,
+    #[serde(default)]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub saved_rule_sets: Vec<SavedRuleSet>,
     pub silence_min_duration_s: f64,
     pub export_target: String,
     pub language: String,
@@ -717,6 +839,10 @@ impl Default for Preferences {
             default_padding: Padding { start_s: 0.15, end_s: 0.15, linked: true },
             cut_aggressiveness: Aggressiveness::Natural,
             custom_filler_words: vec![],
+            profanity_phrases: vec![],
+            keyword_phrases: vec![],
+            never_cut_phrases: vec![],
+            saved_rule_sets: vec![],
             silence_min_duration_s: 0.8,
             export_target: "premiere_xml".into(),
             language: "auto".into(),
@@ -742,7 +868,18 @@ pub struct Project {
     pub id: Uuid,
     pub name: String,
     pub media: Option<Media>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub media_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub resolve_timeline: Option<crate::multicam::ResolveTimelineBinding>,
     pub timeline: Timeline,
+    #[serde(default)]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub protected_ranges: Vec<SourceRange>,
+    #[serde(default)]
+    pub highlighted_ranges: Vec<SourceRange>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub schema_version: u32,
@@ -759,6 +896,8 @@ pub struct Project {
     /// at preview/export; the timeline + transcript stay single-source.
     #[serde(default)]
     pub screen_media: Option<Media>,
+    #[serde(default)]
+    pub screen_media_fingerprint: Option<String>,
     /// How camera and screen compose (only meaningful with screen_media).
     #[serde(default)]
     pub layout: Layout,
@@ -817,6 +956,15 @@ pub struct ClipEditSession {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CutProposal {
     pub id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub rule_dictionary_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub timeline_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub transcript_id: Option<Uuid>,
     /// What asked for these cuts: "Rough cut", "Chat", "Remove pauses".
     pub title: String,
     pub source: ActionSource,
@@ -837,6 +985,15 @@ pub struct ProposedCut {
     /// "pause" (no words inside), "filler" (only filler words: um, uh…) or
     /// "words".
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub rule_category: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub phrase_matches: Vec<PhraseMatchIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub min_word_confidence: Option<f64>,
     /// The words it removes, shortened; empty for a pause.
     pub text: String,
     /// Left out: applying the proposal won't make this cut.
@@ -1183,6 +1340,8 @@ pub struct HistoryEntry {
     pub timestamp: DateTime<Utc>,
     /// Currently in effect (in the undo stack) vs. an undone future step.
     pub applied: bool,
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub has_cut_review: bool,
 }
 
 /// The edit history, oldest → newest. `current_index` is the newest applied
@@ -1248,7 +1407,11 @@ impl Project {
             id: Uuid::new_v4(),
             name: name.to_string(),
             media: None,
+            media_fingerprint: None,
+            resolve_timeline: None,
             timeline: Timeline::new(0.0),
+            protected_ranges: vec![],
+            highlighted_ranges: vec![],
             created_at: now,
             updated_at: now,
             // v2: per-project `settings` removed — Preferences are global and
@@ -1257,6 +1420,7 @@ impl Project {
             deleted_at: None,
             audio_offset_s: 0.0,
             screen_media: None,
+            screen_media_fingerprint: None,
             layout: Layout::default(),
             suggestions: vec![],
             checkpoints: vec![],
@@ -1295,6 +1459,12 @@ impl Project {
 pub struct ProjectSummary {
     pub id: Uuid,
     pub name: String,
+    #[serde(default)]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub source_filename: Option<String>,
+    #[serde(default)]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub source_duration: Option<f64>,
     pub updated_at: DateTime<Utc>,
     /// Present when the project sits in the trash.
     #[serde(default)]

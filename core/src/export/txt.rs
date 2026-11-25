@@ -9,19 +9,16 @@ pub fn write(project: &Project, transcript: &Transcript) -> String {
     let mut paragraphs: Vec<String> = Vec::new();
     let mut current = String::new();
     for seg in &transcript.segments {
-        let mid = (seg.start + seg.end) / 2.0;
-        let included = tl.clips.iter().any(|c| c.included && c.source_in <= mid && mid < c.source_out);
-        let text = seg.text.trim();
-        if seg.is_silence || text.is_empty() || !included {
+        let Some((_, _, text)) = super::srt::edited_segment(tl, seg) else {
             if !current.is_empty() {
                 paragraphs.push(std::mem::take(&mut current));
             }
             continue;
-        }
+        };
         if !current.is_empty() {
             current.push(' ');
         }
-        current.push_str(text);
+        current.push_str(text.trim());
     }
     if !current.is_empty() {
         paragraphs.push(current);

@@ -1,0 +1,50 @@
+PRD 09: FILLERS, PROFANITY, KEYWORDS AND BATCH REVIEW
+Priority: P0 after transcript core
+
+GOAL
+Find unwanted speech patterns deterministically and give editors exact control over which occurrences to cut, protect or replace with silence/beep later.
+
+BUILT-IN RULE GROUPS
+Fillers: um, uh, er, ah, you know, like, sort of, kind of, I mean, okay, so.
+Profanity: configurable dictionary. Do NOT hardcode one universal blacklist or automatically label legitimate quotation as offensive.
+User keywords: phrase and exact keyword sets. Support case-insensitive search, whole-word matching, punctuation normalization, speaker filters.
+Silences: audio-level detection independent from text.
+Repeated takes: suggestion-only, separate higher-risk classifier.
+
+FUNCTIONAL REQUIREMENTS
+RULE-01 Word token normalization handles apostrophes, punctuation, hyphens, case, Unicode and language. Never match 'um' inside 'number' or 'like' inside 'likelihood'.
+RULE-02 Support word and multi-word phrase matching, overlapping matches, optional regex only behind safe pattern limits/timeouts; protect against catastrophic regex.
+RULE-03 Keep each match linked to word IDs, source frame range, rule ID, confidence, category and surrounding context.
+RULE-04 Distinguish search results from cut proposals. Searching never creates edits.
+RULE-05 Per-category select all / none; individual override; saved user rule sets; import/export lists as sanitized text/JSON. Protect specific tokens permanently for that project.
+RULE-06 Allow keep, cut, mute/bleep (P1), or highlight-only action type per match. P0 cut/keep/highlight; no false promise of generated bleeps.
+RULE-07 Detect false positives from quoted speech, character names, interruptions and unfinished words as possible manual-review cases. Never auto-remove named entities solely from profanity match.
+RULE-08 Exclude subtitle/text-only corrections from media cut matching.
+RULE-09 Group adjacent matches into a single safe cut where boundaries overlap; preserve an explicit minimal padding setting. Avoid overlapping or zero-length cuts.
+RULE-10 Every batch returns deterministic preview list and removed-duration estimate before any apply.
+RULE-11 Allow a custom 'never cut these words' list. Exceptions take priority over wildcard bulk rules.
+RULE-12 Save rule and dictionary versions with project so old edit history replays identically.
+
+DATA
+Rule: id, label, category, phrase, normalizedTokens, wholeWord, caseSensitive, language, speakerFilter, timeWindow, action, enabled, createdAt.
+Match: id, ruleId, transcriptVersion, wordIds[], sourceInFrame, sourceOutFrame, confidence, contextBefore, contextAfter, status(PROPOSED,KEPT,CUT,DISMISSED).
+
+IMPL PATHS
+core/src/detect.rs
+core/src/model.rs
+core/src/tools.rs
+core/src/engine/edits.rs
+frontend/src/panels/TranscriptPanel.tsx
+frontend/src/panels/CutReview.tsx
+New: core/src/rules.rs
+New: frontend/src/panels/RulesPanel.tsx
+New: tests/fixtures/rules/*.json
+
+ACCEPTANCE
+R-T1 'um' exact matching excludes 'number' and 'umbrella'.
+R-T2 Multi-word 'you know' matches across punctuation but not across a large unrelated gap.
+R-T3 Select all then deselect occurrence 3 leaves occurrence 3 audible after Resolve import.
+R-T4 Saved rules reload identically, even after app restart.
+R-T5 Repeated/overlapping rules do not generate duplicate or invalid frame intervals.
+R-T6 Search itself has zero timeline effects.
+R-T7 Unicode and non-English examples do not crash normalization.

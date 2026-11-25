@@ -4,13 +4,14 @@
 
 use crate::error::{CoreError, Result};
 use crate::model::{Preferences, Project, ProjectSummary, Transcript};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use uuid::Uuid;
 
 pub trait Store: Send + Sync {
     fn save_project(&self, project: &Project) -> Result<()>;
+    fn save_edit(&self, project: &Project, transcript: Option<&Transcript>, journal: &str, session: Option<(&str, &str)>) -> Result<()>;
     fn load_project(&self, id: Uuid) -> Result<Project>;
     /// Remove the project, its transcript, and its journal. Source media
     /// files on disk are never touched.
@@ -40,6 +41,26 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
+    pub fn open_local_library() -> Result<Self> {
+        let path = Self::default_path();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+            let directory = data_dir();
+            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&directory)?;
+            if !directory.symlink_metadata()?.is_dir() {
+                return Err(CoreError::Storage("The local library directory must be a real directory".into()));
+            }
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+            if path.symlink_metadata().is_ok_and(|metadata| !metadata.is_file()) {
+                return Err(CoreError::Storage("The local library must be a regular file".into()));
+            }
+            let file = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(&path)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        Self::open(&path)
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -60,12 +81,16 @@ impl SqliteStore {
                 model TEXT NOT NULL, vector BLOB NOT NULL,
                 PRIMARY KEY (project_id, segment_id));",
         )?;
-        // Migration for installs that predate the trash: the ALTER fails
-        // harmlessly once the column exists.
-        let _ = conn.execute("ALTER TABLE projects ADD COLUMN deleted_at TEXT", []);
+        let has_deleted_at: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('projects') WHERE name = 'deleted_at')",
+            [], |row| row.get(0),
+        )?;
+        if !has_deleted_at {
+            conn.execute("ALTER TABLE projects ADD COLUMN deleted_at TEXT", [])?;
+        }
         // Schema version rail: future migrations switch on PRAGMA user_version
         // instead of guessing from table shapes. v1 = trash-era schema.
-        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if v < 1 {
             conn.execute_batch("PRAGMA user_version = 1")?;
         }
@@ -105,22 +130,55 @@ pub fn data_dir() -> PathBuf {
         .join("roughcut")
 }
 
+fn save_project_on(conn: &Connection, project: &Project) -> Result<()> {
+    conn.execute(
+        "INSERT INTO projects (id, name, updated_at, doc, deleted_at) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(id) DO UPDATE SET name=?2, updated_at=?3, doc=?4, deleted_at=?5",
+        params![
+            project.id.to_string(),
+            project.name,
+            project.updated_at.to_rfc3339(),
+            serde_json::to_string(project)?,
+            project.deleted_at.map(|time| time.to_rfc3339())
+        ],
+    )?;
+    Ok(())
+}
+
+fn save_transcript_on(conn: &Connection, project_id: Uuid, transcript: &Transcript) -> Result<()> {
+    conn.execute(
+        "INSERT INTO transcripts (project_id, doc) VALUES (?1, ?2)
+         ON CONFLICT(project_id) DO UPDATE SET doc=?2",
+        params![project_id.to_string(), serde_json::to_string(transcript)?],
+    )?;
+    Ok(())
+}
+
 impl Store for SqliteStore {
-    fn save_project(&self, project: &Project) -> Result<()> {
-        let doc = serde_json::to_string(project)?;
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO projects (id, name, updated_at, doc, deleted_at) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(id) DO UPDATE SET name=?2, updated_at=?3, doc=?4, deleted_at=?5",
-            params![
-                project.id.to_string(),
-                project.name,
-                project.updated_at.to_rfc3339(),
-                doc,
-                project.deleted_at.map(|t| t.to_rfc3339())
-            ],
+    fn save_edit(&self, project: &Project, transcript: Option<&Transcript>, journal: &str, session: Option<(&str, &str)>) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn.transaction()?;
+        save_project_on(&transaction, project)?;
+        if let Some(transcript) = transcript {
+            save_transcript_on(&transaction, project.id, transcript)?;
+        }
+        transaction.execute(
+            "INSERT INTO kv (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=?2",
+            params![format!("journal:{}", project.id), journal],
         )?;
+        if let Some((key, value)) = session {
+            transaction.execute(
+                "INSERT INTO kv (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=?2",
+                params![key, value],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
+    }
+
+    fn save_project(&self, project: &Project) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        save_project_on(&conn, project)
     }
 
     fn load_project(&self, id: Uuid) -> Result<Project> {
@@ -129,7 +187,8 @@ impl Store for SqliteStore {
             .query_row("SELECT doc FROM projects WHERE id = ?1", params![id.to_string()], |r| {
                 r.get(0)
             })
-            .map_err(|_| CoreError::NotFound(format!("project {id}")))?;
+            .optional()?
+            .ok_or_else(|| CoreError::NotFound(format!("project {id}")))?;
         let mut project: Project = serde_json::from_str(&doc)?;
         project.upgrade();
         Ok(project)
@@ -148,7 +207,10 @@ impl Store for SqliteStore {
     fn list_projects(&self) -> Result<Vec<ProjectSummary>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, updated_at, deleted_at FROM projects ORDER BY updated_at DESC",
+            "SELECT id, name, updated_at, deleted_at,
+                    CASE WHEN json_valid(doc) THEN json_extract(doc, '$.media.file_path') END,
+                    CASE WHEN json_valid(doc) THEN json_extract(doc, '$.media.duration') END
+             FROM projects ORDER BY updated_at DESC",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((
@@ -156,11 +218,13 @@ impl Store for SqliteStore {
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<f64>>(5)?,
             ))
         })?;
         let mut out = vec![];
         for row in rows {
-            let (id, name, updated_at, deleted_at) = row?;
+            let (id, name, updated_at, deleted_at, source_path, source_duration) = row?;
             fn parse(t: &str) -> Result<chrono::DateTime<chrono::Utc>> {
                 chrono::DateTime::parse_from_rfc3339(t)
                     .map(|d| d.with_timezone(&chrono::Utc))
@@ -169,6 +233,8 @@ impl Store for SqliteStore {
             out.push(ProjectSummary {
                 id: Uuid::parse_str(&id).map_err(|e| CoreError::Storage(e.to_string()))?,
                 name,
+                source_filename: source_path.as_deref().and_then(|path| path.rsplit(['/', '\\']).next()).map(str::to_owned),
+                source_duration,
                 updated_at: parse(&updated_at)?,
                 deleted_at: deleted_at.as_deref().map(parse).transpose()?,
             });
@@ -177,14 +243,8 @@ impl Store for SqliteStore {
     }
 
     fn save_transcript(&self, project_id: Uuid, transcript: &Transcript) -> Result<()> {
-        let doc = serde_json::to_string(transcript)?;
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO transcripts (project_id, doc) VALUES (?1, ?2)
-             ON CONFLICT(project_id) DO UPDATE SET doc=?2",
-            params![project_id.to_string(), doc],
-        )?;
-        Ok(())
+        save_transcript_on(&conn, project_id, transcript)
     }
 
     fn load_transcript(&self, project_id: Uuid) -> Result<Option<Transcript>> {
@@ -195,7 +255,7 @@ impl Store for SqliteStore {
                 params![project_id.to_string()],
                 |r| r.get(0),
             )
-            .ok();
+            .optional()?;
         match doc {
             Some(d) => Ok(Some(serde_json::from_str(&d)?)),
             None => Ok(None),
@@ -215,9 +275,9 @@ impl Store for SqliteStore {
     fn load_preferences(&self) -> Result<Preferences> {
         let conn = self.conn.lock().unwrap();
         let doc: Option<String> =
-            conn.query_row("SELECT doc FROM preferences WHERE id = 1", [], |r| r.get(0)).ok();
+            conn.query_row("SELECT doc FROM preferences WHERE id = 1", [], |r| r.get(0)).optional()?;
         match doc {
-            Some(d) => Ok(serde_json::from_str(&d).unwrap_or_default()),
+            Some(d) => Ok(serde_json::from_str(&d)?),
             None => Ok(Preferences::default()),
         }
     }
@@ -226,7 +286,7 @@ impl Store for SqliteStore {
         let conn = self.conn.lock().unwrap();
         Ok(conn
             .query_row("SELECT value FROM kv WHERE key = ?1", params![key], |r| r.get(0))
-            .ok())
+            .optional()?)
     }
 
     fn set_kv(&self, key: &str, value: &str) -> Result<()> {

@@ -1,0 +1,63 @@
+#!/bin/sh
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+APP="$ROOT/target/release/bundle/macos/RoughCut.app"
+ACTION=${1:-launch}
+
+usage() {
+  cat <<'USAGE'
+RoughCut launcher
+
+Usage: ./roughcut-launcher [setup|build|launch|help]
+
+  setup          Install locked frontend dependencies safely, then build
+  build          Build the macOS app
+  launch         Open the existing app, or build it if missing (default)
+USAGE
+}
+
+build_app() {
+  if ! command -v cargo-tauri >/dev/null 2>&1; then
+    echo 'Missing reviewed Tauri CLI. Install it with: cargo install tauri-cli --version ^2 --locked' >&2
+    exit 1
+  fi
+  if ! command -v npm >/dev/null 2>&1 || ! command -v cargo >/dev/null 2>&1; then
+    echo 'Install Node.js/npm and Rust/Cargo before building.' >&2
+    exit 1
+  fi
+  if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+    echo 'Install FFmpeg tools first: brew install ffmpeg' >&2
+    exit 1
+  fi
+  if [ ! -d "$ROOT/frontend/node_modules" ]; then
+    echo 'Installing locked frontend dependencies (lifecycle scripts disabled)...'
+    npm ci --prefix "$ROOT/frontend" --ignore-scripts
+  fi
+  echo 'Building RoughCut.app...'
+  NPM_CONFIG_IGNORE_SCRIPTS=true bash "$ROOT/scripts/build-macos-app.sh"
+}
+
+case "$ACTION" in
+  setup)
+    command -v npm >/dev/null 2>&1 || { echo 'Install Node.js/npm first.' >&2; exit 1; }
+    npm ci --prefix "$ROOT/frontend" --ignore-scripts
+    build_app
+    open "$APP"
+    ;;
+  build)
+    build_app
+    ;;
+  launch)
+    if [ ! -x "$APP/Contents/MacOS/roughcut-app" ]; then build_app; fi
+    open "$APP"
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    echo "Unknown action: $ACTION" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

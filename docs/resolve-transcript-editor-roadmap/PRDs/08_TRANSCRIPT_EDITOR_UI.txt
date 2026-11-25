@@ -1,0 +1,53 @@
+PRD 08: TRANSCRIPT EDITOR USER EXPERIENCE
+Priority: P0 after first Resolve PoC
+
+GOAL
+Make transcript-based editing visually clear and faster than manual cuts. Avoid accidental destructive edits caused by text selection or accidental keypress.
+
+SCREENS
+A. Library/Projects: original filename, duration, status, last edit, Resolve linkage, open/duplicate/delete.
+B. Transcript workspace: video preview on left or top, waveform/timeline at bottom, transcript centered, review/search sidebar.
+C. Review panel: proposed edits, categories, individual checkboxes, reasons, before/after duration, exceptions.
+D. Handoff panel: Resolve support status, source fingerprint, output type, selected project, export/import action, result and troubleshooting.
+
+INTERACTIONS
+UI-01 Click word to seek source; pressing play follows words and auto-scrolls without jumping while selecting.
+UI-02 Shift-click or drag-select words and paragraphs to mark a range. Selection alone does not cut.
+UI-03 Explicit actions: Cut selected media, Keep/protect selected, Highlight only, Copy text, Change transcript text.
+UI-04 Color/state must be distinguishable without color: ORIGINAL, SUGGESTED CUT, APPROVED CUT, PROTECTED, ALREADY CUT, LOW CONFIDENCE.
+UI-05 Tabs/filters: All, Fillers, Profanity, Phrases, Silences, Repeated takes, Manual notes.
+UI-06 Search exact word, whole word, case sensitivity, phrase, include/exclude speaker and time window. Show match count and context.
+UI-07 Select all matches of type; one-click deselect; protect exceptions; keyboard shortcuts with command cheat sheet.
+UI-08 Before applying edits, show cut list, number of words, estimated removed seconds, resulting duration, cut-edge playback preview. Approve once to create one undo checkpoint.
+UI-09 Undo/redo keyboard and visible history; history survives restart.
+UI-10 Toggle Original vs Edited preview. Edit state stays consistent between waveform, transcript and preview.
+UI-11 Export visibly reports progress, final path, source media and imported timeline name. Errors are recoverable.
+UI-12 Long transcripts must use virtualization; avoid rendering tens of thousands of DOM word nodes simultaneously.
+UI-13 Transcript view must be keyboard-operable, screen reader labels, accessible selection states, zoom/responsive layout.
+UI-14 No modal automatically grants access, performs downloads, or applies suggested cuts.
+UI-15 A single P0 app is sufficient; do not spend effort on native Studio UI before UX passes with users.
+
+DESIGN RULES
+Stick to existing frontend architecture (React, TanStack, single stylesheet). Do not introduce a second state store or edit engine. Rust core remains authoritative. UI mirrors core state via typed IPC; no browser-only hidden cut state.
+
+IMPL PATHS
+frontend/src/panels/TranscriptPanel.tsx
+frontend/src/panels/CutReview.tsx
+frontend/src/panels/PreviewPanel.tsx
+frontend/src/timeline/Timeline.tsx
+frontend/src/panels/ExportMenu.tsx
+frontend/src/panels/SetupPanel.tsx
+frontend/src/state/viewStore.ts
+frontend/src/ipc/queries.ts
+frontend/src/ipc/api.ts
+frontend/src/styles.css
+core/src/model.rs
+core/src/tools.rs
+
+ACCEPTANCE
+UI-T1 A new user can remove selected 'um' instances and keep others without documentation.
+UI-T2 Selecting a word, typing in search, or pressing Backspace in a transcript text field cannot silently cut media.
+UI-T3 Undo returns exact same source ranges and visual state.
+UI-T4 A 60-minute transcript scrolls fluidly without crashes or full rerender on every keystroke.
+UI-T5 All core actions usable with keyboard and clearly announced for accessibility.
+UI-T6 Any error leaves the unsaved edit plan recoverable.

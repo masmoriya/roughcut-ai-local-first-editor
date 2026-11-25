@@ -10,6 +10,24 @@ export interface Range {
   end: number;
 }
 
+export function overlapsRange(range: Range, ranges: readonly Range[] | undefined): boolean {
+  return ranges?.some((other) => other.start < range.end && range.start < other.end) ?? false;
+}
+
+export function mergeRanges(ranges: readonly Range[]): Range[] {
+  const sorted = ranges.filter(({ start, end }) => end > start).sort((a, b) => a.start - b.start);
+  const merged: Range[] = [];
+  for (const range of sorted) {
+    const previous = merged.at(-1);
+    if (previous && range.start <= previous.end) {
+      previous.end = Math.max(previous.end, range.end);
+    } else {
+      merged.push({ ...range });
+    }
+  }
+  return merged;
+}
+
 /** The excluded portions of the timeline, sorted, in source time. */
 export function excludedRanges(clips: Clip[]): Range[] {
   return clips

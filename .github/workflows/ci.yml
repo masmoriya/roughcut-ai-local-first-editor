@@ -20,11 +20,11 @@ jobs:
         with:
           prefix-key: v2-metal  # cache from pre-metal builds left stale ggml objects
       - name: Test core (fixture adapters, fully offline)
-        run: cargo test -p roughcut-core
+        run: cargo test --locked -p roughcut-core
         env:
           FABLE_DEMO: "1"
       - name: Build MCP shim
-        run: cargo build -p roughcut-mcp-shim
+        run: cargo build --locked -p roughcut-mcp-shim
 
   frontend:
     name: Frontend build
@@ -36,7 +36,7 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: frontend/package-lock.json
-      - run: npm ci
+      - run: npm ci --ignore-scripts
         working-directory: frontend
       - run: npm run build
         working-directory: frontend
@@ -63,6 +63,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
-      - run: npm ci && npm run build
+      - run: npm ci --ignore-scripts && npm run build
         working-directory: frontend
-      - run: cargo build -p roughcut-app
+      - run: cargo build --locked -p roughcut-app
+      - name: Test desktop permissions and media protocol
+        if: runner.os == 'macOS'
+        run: cargo test --locked -p roughcut-app --lib

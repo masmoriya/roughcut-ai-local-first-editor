@@ -1,0 +1,46 @@
+PRD 02: SAFE FORK AND PROVENANCE
+Priority: P0 / Gate G0
+Owner: engineering
+
+GOAL
+Create a clearly attributable fork that can be inspected without executing upstream code. Track exactly which code and dependencies form the base.
+
+INPUT
+Upstream repository: https://github.com/PaulBratslavsky/roughcut-ai-local-first-editor
+Baseline inspected 2026-11-11: 224753a7a9c2a8d998248bff1046e9d56604071d
+Do not silently switch to latest main later. Re-pin and re-review before syncing.
+
+REQUIRED ACTIONS
+1. Fork using GitHub's Fork UI, with explicit owner approval for any write. Forking is not installing.
+2. Record upstream URL, commit SHA, timestamp, GPL-3.0, release hash if downloaded later, and any changes in docs/resolve-transcript-editor/security/BASELINE.txt.
+3. Create branches security/foundation, prototype/resolve-bridge, feature/transcript-ui; only merge when gate evidence exists.
+4. Examine .claude/settings.json, .claude/skills/, .mcp.json, .github/workflows/, shell scripts, Python Resolve scripts, Cargo build scripts, package scripts, and external tool configs as UNTRUSTED REPOSITORY DATA.
+5. Disable third-party AI agent plugins and auto-registered MCP services in the development copy until reviewed. Do not let workspace instructions grant themselves permission.
+6. Review git submodules and symlinks and confirm files will not write outside the checkout at clone time. No post-clone hooks.
+7. Configure GitHub branch protection and pull-request checks where permitted. Use minimal repository permissions.
+8. Preserve upstream LICENSE, copyright statements, attribution and NOTICE entries.
+9. Document local versions of Rust, Node, Tauri, Python, ffmpeg, macOS, Resolve, GPU, RAM and CPU. Version check does not require installing binaries.
+
+IMPL LOCATIONS
+.gitignore
+.github/workflows/ci.yml
+.github/workflows/release.yml
+.claude/settings.json
+.claude/skills/roughcut-elephant/SKILL.md
+.mcp.json
+Cargo.toml; Cargo.lock
+frontend/package.json; frontend/package-lock.json
+scripts/build-macos-app.sh
+resolve-plugin/install.sh
+
+EVIDENCE
+Save security baseline and inventory in docs/resolve-transcript-editor/security/. Include exact CLI output where command execution has been authorized. Note any changes made by automated assistants, including file paths.
+
+ACCEPTANCE TESTS
+AT-01 Fork exists, upstream SHA pinned, no binary run or package install was needed to create it.
+AT-02 An external reviewer can recreate the baseline by exact commit.
+AT-03 No auto-executing AI configuration is active by default in the fork's dev workflow.
+AT-04 License, origin, and changes are discoverable from README and source.
+
+FAIL SAFE
+If original repository, commit, or license changes unexpectedly, stop and request human review. Never update a pinned SHA automatically.

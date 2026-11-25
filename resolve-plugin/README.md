@@ -1,5 +1,14 @@
 # RoughCut for DaVinci Resolve
 
+For this fork, open the intended RoughCut project and choose **DaVinci
+Resolve timeline** from Export. In the intended Resolve project, import the
+saved XML as a new timeline. This workflow uses the export's original media
+paths and leaves the current timeline intact.
+
+The upstream scripts below depend on MCP and AI. This fork's desktop app
+does not expose those services. The scripts are retained as upstream
+reference and are not part of the local setup.
+
 Two Scripts-menu entries (Workspace ▸ Scripts ▸ Utility):
 
 - **RoughCut AI Draft** — select a clip in the media pool, run it, and an

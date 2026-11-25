@@ -20,7 +20,7 @@ rand.workspace = true
 dirs.workspace = true
 async-trait.workspace = true
 sha2.workspace = true
-portable-pty.workspace = true
+unicode-normalization = "0.1.25"
 base64.workspace = true
 # whisper-native: in-process whisper.cpp (no PATH dependency, real progress).
 # Off by default so core builds/tests stay light; the app crate turns it on.
@@ -36,7 +36,7 @@ ts-rs = { version = "10", features = ["uuid-impl", "chrono-impl"], optional = tr
 
 # word-align: forced alignment of the transcript's words against the audio
 # with a local wav2vec2 model (Candle, pure Rust). Off by default so core
-# builds/tests stay light; the app crate turns it on. Pinned: a 0.1 crate.
+# builds/tests stay light. The desktop app uses imported transcript timing.
 wav2vec2-rs = { version = "=0.1.0", optional = true }
 
 [features]
@@ -56,5 +56,5 @@ objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSEnumerator", "NSError", "NSString", "NSURL"] }
 objc2-vision = { version = "0.3", default-features = false, features = ["std", "VNRequest", "VNRequestHandler", "VNDetectFaceRectanglesRequest", "VNObservation", "VNTypes", "objc2-core-foundation"] }
 
-[dev-dependencies]
-tempfile = "3"
+[dependencies.tempfile]
+version = "3"

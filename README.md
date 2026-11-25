@@ -1,22 +1,45 @@
 # RoughCut
 
-**An open-source, local-first, AI-powered video editor.** Raw talking-head
-footage goes in; a clean rough cut comes out — **entirely on your machine**.
-Transcribe on-device, let a local LLM remove silences, filler words, and bad
-takes, refine by editing the transcript or chatting with your footage, then
-export to Premiere, Final Cut, or DaVinci Resolve. No upload, no
-subscription, no account.
+This fork is a local transcript-based video editor for DaVinci Resolve.
+Open a video, import timed JSON or SRT from the exact same media export, and
+select words or paragraphs to cut, protect, highlight, or correct. Review
+pause and filler proposals before applying them. Export Resolve XML and
+import it as a new timeline when Resolve is idle.
 
-Uniquely, the editor exposes its tools over [MCP](https://modelcontextprotocol.io),
-so Claude Desktop or Claude Code can drive it — the same tool registry powers
-the local agent loop and the UI. One tool set, three callers.
+The desktop workflow uses FFmpeg and FFprobe for local media processing.
+AI, model downloads, and MCP are disabled in the desktop app.
 
-> Mission: prove that a paid cloud AI service can be replaced by owned,
-> local-first software. See [`docs/01-product.md`](docs/01-product.md).
+## Build this fork on macOS
 
-![RoughCut — terminal-style editor with transcript, preview, and timeline](docs/screenshot-dark.png)
+From the fork checkout, run the reusable launcher:
+
+```bash
+./roughcut-launcher setup
+```
+
+This installs locked frontend dependencies with package lifecycle scripts
+disabled, builds `RoughCut.app`, and opens it. Requirements: macOS, Rust/Cargo,
+Node.js/npm, the reviewed Tauri CLI (`cargo install tauri-cli --version '^2'
+--locked`), FFmpeg, and FFprobe. Run `./roughcut-launcher` later to reopen the
+app, `./roughcut-launcher build` to rebuild, or `./roughcut-launcher help` to
+see all actions. The app bundle is at
+`target/release/bundle/macos/RoughCut.app`.
+
+In RoughCut, attach the source, import timed text that matches that exact
+media export, select a passage to cut, and choose **DaVinci Resolve timeline**
+from Export. In Resolve, import the saved XML as a new timeline. The old
+Resolve menu scripts rely on MCP/AI services this fork disables, so they are
+not a supported launch path here.
+
+See [local verification](docs/resolve-transcript-editor/LOCAL-VERIFICATION.md)
+for the transcript format, BTN media checks, and pending desktop and
+Resolve acceptance tests. The [release manifest](docs/resolve-transcript-editor/RELEASE_MANIFEST.txt)
+records the pinned baseline and build evidence.
 
 ---
+
+The sections below describe the upstream project and include features and
+setup commands outside this fork's desktop workflow.
 
 ## Highlights
 

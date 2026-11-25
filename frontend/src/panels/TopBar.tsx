@@ -3,22 +3,22 @@
 
 import { useState } from "react";
 import { useStore } from "@tanstack/react-store";
-import { useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { ask, message } from "@tauri-apps/plugin-dialog";
 import { callTool, isTauri } from "../ipc/api";
+import type { Project } from "../ipc/types";
 import { useProject, useProjects, useRedo, useRestoreProject, useUndo } from "../ipc/queries";
 import { setProjectId, setScreen, viewStore, type AppScreen } from "../state/viewStore";
 import { newProjectFromDialog } from "../newProject";
-import { errText } from "./clipUtil";
+import { OpenResolveReview, ResolveReviewPlan } from "./ResolveReview";
+import { clock, errText } from "./clipUtil";
 import { ExportMenu } from "./ExportMenu";
-import { ModelChip } from "./ModelChip";
 import { currentTheme, toggleTheme } from "../theme";
 import { SetupPanel } from "./SetupPanel";
 
 /** The app's screens, in the top bar's switch: id, label, tooltip. */
 const SCREENS: [AppScreen, string, string][] = [
   ["editor", "Editor", "Edit the cut: transcript, timeline and tools"],
-  ["shorts", "Shorts", "Scan the video for shorts and make them in bulk"],
   ["clips", "Clips", "Every saved clip: play, crop and export them"],
 ];
 
@@ -35,6 +35,22 @@ export function TopBar({
   const projects = useProjects();
   const { data: project } = useProject(projectId);
   const queryClient = useQueryClient();
+  const duplicate = useMutation({
+    mutationFn: () => {
+      const names = new Set(projects.data?.projects.map((item) => item.name));
+      let name = `${projectName} (copy)`;
+      for (let index = 2; names.has(name); index++) name = `${projectName} (copy ${index})`;
+      return callTool<Project>("duplicate_project", { project_id: projectId, name });
+    },
+    onSuccess: (copy) => {
+      setProjectId(copy.id);
+      void queryClient.invalidateQueries();
+    },
+    onError: (error) => {
+      if (isTauri) void message(errText(error), { title: "Duplicate project", kind: "error" });
+      else window.alert(errText(error));
+    },
+  });
   const [showSetup, setShowSetup] = useState(false);
   const [theme, setTheme] = useState(currentTheme());
   const screen = useStore(viewStore, (s) => s.screen);
@@ -86,10 +102,11 @@ export function TopBar({
   return (
     <header className="topbar">
       <div className="topbar-left">
-        <span className="app-mark">Fable</span>
+        <span className="app-mark">RoughCut</span>
         {list.length > 1 || trash.length > 0 ? (
           <select
             className="project-select"
+            aria-label="Switch project"
             value={projectId}
             title="Switch project — trashed projects restore when selected"
             onChange={(e) => onSelectProject(e.target.value)}
@@ -97,10 +114,12 @@ export function TopBar({
             {list.map((p) => (
               <option key={p.id} value={p.id}>
                 {p.name}
+                {p.source_filename && p.source_filename !== p.name && ` · ${p.source_filename}`}
+                {p.source_duration != null && ` · ${clock(p.source_duration)}`}
               </option>
             ))}
             {trash.length > 0 && (
-              <optgroup label="trash — select to restore">
+              <optgroup label="Trash · kept for 30 days">
                 {trash.map((p) => (
                   <option key={p.id} value={`trash:${p.id}`}>
                     ↩ {p.name}
@@ -110,7 +129,7 @@ export function TopBar({
             )}
           </select>
         ) : (
-          <span className="project-name" title={projectName}>
+          <span className="project-name" title={list[0]?.source_filename ?? projectName}>
             {projectName}
           </span>
         )}
@@ -120,6 +139,10 @@ export function TopBar({
           onClick={() => void onNewVideo()}
         >
           + New video
+        </button>
+        {isTauri && <OpenResolveReview onOpen={setProjectId} />}
+        <button className="ghost-btn" disabled={!project || !!project.clip_session || duplicate.isPending} onClick={() => duplicate.mutate()}>
+          Duplicate
         </button>
         <button
           className="icon-btn delete-project-btn"
@@ -133,7 +156,6 @@ export function TopBar({
         </button>
       </div>
       <div className="topbar-right">
-        <ModelChip />
         <div className="screen-switch" role="tablist" aria-label="Screen">
           {SCREENS.map(([id, label, title]) => (
             <button
@@ -193,15 +215,20 @@ export function TopBar({
             <path d="M13.5 6.5H6a3.5 3.5 0 0 0 0 7h3" />
           </svg>
         </button>
-        <ExportMenu
+        {project?.resolve_timeline
+          ? <ResolveReviewPlan key={projectId} projectId={projectId} binding={project.resolve_timeline} />
+          : <ExportMenu
+          key={projectId}
           projectId={projectId}
           projectName={projectName}
+          sourceAudioTracks={(project?.media as { source_audio_tracks?: number } | null | undefined)?.source_audio_tracks}
+          sourceAudioChannels={(project?.media as { source_audio_channels?: number } | null | undefined)?.source_audio_channels}
           blocked={
             project?.clip_session
               ? "You're editing a clip: save or cancel it first (export the clip from the Clips screen)"
               : undefined
           }
-        />
+        />}
       </div>
     </header>
   );

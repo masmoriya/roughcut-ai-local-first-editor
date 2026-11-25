@@ -1,0 +1,80 @@
+ARCHITECTURE AND DATA CONTRACT
+Priority: shared specification for PRDs 06-11
+
+DECISION A: APPLICATION SHAPE
+P0: macOS desktop Tauri React UI + local Rust core + optional audited Resolve Python scripts + XML interchange. Do not add a second long-lived editing database/server.
+P2: optional Resolve Studio Workflow Integration UI; core remains separate.
+
+DECISION B: SOURCE OF TRUTH
+Rust project store is authoritative for Transcript, EditPlan, ExportManifest and edit journal. UI does not manage shadow edits. Resolve imported timeline is a generated artifact, not canonical state in P0.
+
+SUGGESTED VERSIONED TYPES
+MediaRef:
+  media_id, absolute_path, sha256 or strong fingerprint, size_bytes, mtime_ns,
+  fps_numerator, fps_denominator, drop_frame, audio_stream_index,
+  source_start_timecode, duration_frames, has_video, has_audio.
+
+WordRecord:
+  word_id, segment_id, raw_text, corrected_text nullable,
+  normalized_text, source_start_frame, source_end_frame,
+  confidence nullable, speaker_id nullable, provenance.
+
+TranscriptRecord:
+  transcript_id, media_id, version, language, engine,
+  model_name, model_hash, created_at, words[], segments[], corrections[].
+
+RuleRecord:
+  id, version, category, phrase, normalized_tokens[], action,
+  enabled, speaker_filter nullable, time_range nullable,
+  whole_word, case_sensitive, protected_exceptions[].
+
+CutMatch:
+  id, transcript_id, rule_id nullable, word_ids[],
+  source_start_frame, source_end_frame, confidence nullable,
+  state FOUND | PROPOSED | PROTECTED | APPROVED | APPLIED | DISMISSED.
+
+EditPlan:
+  plan_id, media_id, transcript_version, version,
+  source_fps, proposed_ranges[], protected_ranges[],
+  applied_ranges[], kept_ranges[], preview_hash, journal_entry_id.
+
+BridgeManifest:
+  job_id, roughcut_project_id, resolve_project_id nullable,
+  resolve_media_item_id nullable, media_fingerprint, edit_plan_version,
+  source_timebase, xml_path, imported_timeline_name nullable,
+  state CREATED | EXPORTED | IMPORTED | FAILED, error nullable.
+
+CONTRACT RULES
+1. Version all persisted types; migrations are explicit, backed up, tested, reversible where practical.
+2. Use opaque IDs, never infer identity from display name alone.
+3. Cut ranges are half-open [start_frame, end_frame), no negative or zero-width intervals.
+4. Rounding only on timebase boundaries; conversion test covers 24000/1001 and 30000/1001.
+5. Maintain deterministic edit order; normalize range overlaps and protected exceptions before apply.
+6. UI may propose, but only Rust can validate/apply cuts.
+7. Each external job has idempotency key; retries do not double-export or duplicate edits.
+8. Never serialize bearer tokens or API keys in project/export manifests.
+9. Export manifest may contain absolute source paths locally; redact before sharing bug reports.
+10. Separate read/transcript correction/cut actions, with explicit tool permissions.
+
+PROPOSED CORE API (DO NOT BREAK EXISTING TOOLS WITHOUT MIGRATION)
+get_capabilities() -> edition/version features, local engine capability states
+get_transcript(project_id, page) -> versioned words and segments
+find_matches(project_id, ruleset) -> match[] (read only)
+propose_cut_batch(project_id, match_ids, overrides) -> proposal and preview
+preview_cut_plan(project_id, proposal_id) -> kept spans and estimates
+apply_cut_plan(project_id, proposal_id, expected_version) -> journal ID
+undo_edit(project_id, journal_id) -> restored state
+export_resolve(project_id, output_path, expected_plan_version) -> manifest
+list_bridge_projects(resolve_project_id, selected_media_ref) -> match candidates
+
+ROUTING
+Use existing core/src/tools.rs ToolSpec rows; agent sees read/propose subset only; MCP external policy requires approval; UI owns explicit user gesture.
+
+FILES
+core/src/model.rs; core/src/time.rs; core/src/tools.rs
+core/src/store.rs; core/src/engine/edits.rs
+frontend/src/ipc/generated/ (generated, not hand-edited)
+New: core/src/edit_plan.rs, core/src/rules.rs, core/src/bridge_manifest.rs
+
+MIGRATION SAFETY
+Before changing existing Project schema, create fixture snapshots from upstream store. On migration failure, keep backup intact and return actionable error. Never migrate private source projects during first sandbox test.

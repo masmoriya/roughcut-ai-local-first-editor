@@ -3,7 +3,7 @@ name = "roughcut-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "RoughCut — local-first AI video editor (Tauri v2 shell wiring the core to the web frontend)."
+description = "RoughCut — local transcript-based video editor with DaVinci Resolve XML export."
 
 [lib]
 name = "roughcut_app"
@@ -13,10 +13,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-# whisper-native: end users always get the in-process transcriber; the flag
-# only exists so core-only builds/tests stay light (it compiles whisper.cpp).
-roughcut-core = { path = "../../core", features = ["whisper-native", "word-align"] }
-tauri = { version = "2", features = ["protocol-asset"] }
+roughcut-core = { path = "../../core", features = ["whisper-native"] }
+tauri = { version = "2", features = [] }
 percent-encoding = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"

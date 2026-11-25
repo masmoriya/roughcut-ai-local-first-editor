@@ -1,0 +1,49 @@
+PRD 05: DAVINCI RESOLVE CAPABILITY SPIKE
+Priority: P0 / Gate G2. STOP HERE IF LIVE TIMELINE IMPORT FAILS.
+
+GOAL
+Prove real compatibility with the installed Resolve edition/version before designing a workflow that depends on undocumented capabilities.
+
+KNOWN EXTERNAL FACTS (VERIFY LIVE)
+RoughCut ships two menu scripts in resolve-plugin/ and claims free-edition support for script-menu import. This claim is not independently validated in this project.
+Workflow Integrations use a native embedded UI and are Studio-only.
+Resolve 21.1 added MediaPoolItem.GetTranscription; 21.1.2 added SetTranscription, which requires Studio. Older versions may lack these methods. Transcriptions describe source timecode, not necessarily timeline positions.
+Resolve 21/21.1 may have edition-specific restrictions for scripting calls. Feature-detect and test, do not assume.
+
+TARGET TEST MATRIX
+A. Resolve Free: actual installed version, macOS, one selected media pool clip; script menu invocation, XML import, audio/video link, timeline placement.
+B. Resolve Studio: same test plus external scripting in local mode and Studio-only APIs.
+C. Versions: current target Resolve 21.x; optional backward smoke for 20.x. Capture build number.
+D. Script entry points: Workspace > Scripts > Utility; refresh/restart, no admin rights for per-user scripts where supported.
+E. Media: 24, 25, 29.97 and 30 fps; mono/stereo; .mov and .mp4; one file with spaces and Unicode path.
+
+REQUIRED SPIKES
+R-01 Create a completely disposable Resolve library/project and a 15-second synthesized or licensed spoken video. Never use a live edit.
+R-02 Confirm Python Scripts-menu execution and identify what Resolve exposes: Resolve/Project/MediaPool/MediaPoolItem/Timeline.
+R-03 Confirm GetSelectedClips presence or find stable selection fallback. Do not silently use first root-folder clip when multiple exist.
+R-04 Confirm media properties: File Path, fps, source start/end, audio streams, frame count, and source timecode.
+R-05 Export minimal FCP7 xmeml from RoughCut. Call ImportTimelineFromFile and verify correct new timeline and media link.
+R-06 Test re-importing same XML creates a new timeline; original timeline unchanged. Record naming/conflicts.
+R-07 Confirm timecode/frame conversions for 23.976/29.97 (drop-frame and non-drop), 25, 30 and VFR source. Reject unsupported VFR if tests expose drift.
+R-08 In Studio 21.1+, call GetTranscription (if available); compare word timings to independent local Whisper. In 21.1.2+ try SetTranscription on throwaway item only and verify return value; do not require native transcript API for P0.
+R-09 Test effects of media relinking, renaming, moving files, offline media, nested bins, and copied timelines.
+R-10 Test Python external scripting Studio-only condition. Keep Scripts-menu import as baseline; if free script-menu functions fail, document a manual XML import fallback or revise stated support.
+
+IMPLEMENTATION PATHS
+resolve-plugin/RoughCut AI Draft.py
+resolve-plugin/RoughCut Import Cut.py
+resolve-plugin/README.md
+core/src/resolve.rs
+core/src/export/xmeml.rs
+core/src/export/mod.rs
+New: tests/resolve_integration/ (independent harness and sample fixture manifest)
+New: docs/resolve-transcript-editor/evidence/RESOLVE_MATRIX.txt
+
+ACCEPTANCE G2
+- From a chosen source video, an approved script produces and imports a NEW, real, editable Resolve timeline.
+- Correct source media path, audio and video, word-selected cut boundaries within one frame, and no unexpected clip offsets.
+- All baseline tests use the edition actually supported; unsupported functions show a specific error and documented fallback.
+- At least one real in-Resolve screen recording or console log, XML fixture, and expected/actual frame map saved as evidence.
+
+STOP RULE
+If reliable imported audio+video or timebase cannot be proven, stop transcript UI work. Investigate XML writer or change handoff strategy; do not declare false compatibility.

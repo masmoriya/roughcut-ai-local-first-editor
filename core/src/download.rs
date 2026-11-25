@@ -6,8 +6,26 @@
 use crate::error::{CoreError, Result};
 use crate::events::{send, CoreEvent, ProgressTask, SharedSink};
 use sha2::{Digest, Sha256};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
+
+pub(crate) fn verify_file(path: &Path, expected: &str) -> Result<()> {
+    if !path.symlink_metadata()?.is_file() {
+        return Err(CoreError::Unavailable("Model must be a regular file".into()));
+    }
+    let mut file = std::fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 { break; }
+        digest.update(&buffer[..read]);
+    }
+    if format!("{:x}", digest.finalize()) != expected {
+        return Err(CoreError::Unavailable("Model checksum failed. Verify or repair the model in Setup.".into()));
+    }
+    Ok(())
+}
 
 pub struct DownloadOpts<'a> {
     pub task: ProgressTask,
@@ -18,17 +36,18 @@ pub struct DownloadOpts<'a> {
 }
 
 /// Stream `url` to `dest`. Never leaves a half-written file at `dest`:
-/// writes to `<dest>.part`, verifies, then renames.
+/// writes to a private temporary file, verifies, then renames.
 pub async fn download_to(
     sink: &SharedSink,
     url: &str,
     dest: &Path,
     opts: DownloadOpts<'_>,
 ) -> Result<()> {
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let parent = dest.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
     let client = reqwest::Client::builder()
+        .https_only(true)
+        .read_timeout(std::time::Duration::from_secs(60))
         .user_agent("roughcut")
         .build()
         .map_err(|e| CoreError::Unavailable(format!("download client: {e}")))?;
@@ -42,11 +61,11 @@ pub async fn download_to(
     }
     let total = resp.content_length().or(opts.approx_bytes).unwrap_or(0);
 
-    let part = dest.with_extension(format!(
-        "{}.part",
-        dest.extension().and_then(|e| e.to_str()).unwrap_or("bin")
-    ));
-    let mut file = std::fs::File::create(&part)?;
+    let max_bytes = opts.approx_bytes.map(|bytes| bytes.saturating_mul(2)).unwrap_or(4 * 1024 * 1024 * 1024);
+    if resp.content_length().is_some_and(|size| size > max_bytes) {
+        return Err(CoreError::Unavailable("Model download exceeds its size limit".into()));
+    }
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
     let mut hasher = Sha256::new();
     let mut written: u64 = 0;
     let mut last_percent = 0u64;
@@ -54,11 +73,14 @@ pub async fn download_to(
     while let Some(chunk) =
         resp.chunk().await.map_err(|e| CoreError::Unavailable(format!("download: {e}")))?
     {
+        written = written.saturating_add(chunk.len() as u64);
+        if written > max_bytes {
+            return Err(CoreError::Unavailable("Model download exceeds its size limit".into()));
+        }
         file.write_all(&chunk)?;
         if opts.sha256.is_some() {
             hasher.update(&chunk);
         }
-        written += chunk.len() as u64;
         if total > 0 {
             let percent = written * 100 / total;
             if percent > last_percent {
@@ -75,17 +97,15 @@ pub async fn download_to(
             }
         }
     }
-    drop(file);
-
     if let Some(expected) = opts.sha256 {
         let digest = format!("{:x}", hasher.finalize());
         if digest != expected {
-            let _ = std::fs::remove_file(&part);
             return Err(CoreError::Other(format!(
                 "download corrupted (sha256 {digest} != expected {expected}); removed — try again"
             )));
         }
     }
-    std::fs::rename(&part, dest)?;
+    file.as_file().sync_all()?;
+    file.persist(dest).map_err(|error| error.error)?;
     Ok(())
 }

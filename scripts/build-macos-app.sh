@@ -15,10 +15,6 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../app/src-tauri"
 
-# ggml-metal emits @available checks (___isPlatformVersionAtLeast). rustc links
-# with -nodefaultlibs, so clang's runtime has to be passed in explicitly.
-export RUSTFLAGS="-Clink-arg=$(clang --print-resource-dir)/lib/darwin/libclang_rt.osx.a"
-
 args=(--bundles app)
 [[ " $* " == *" --bundles "* ]] && args=()
 
@@ -33,9 +29,18 @@ else
   echo "No \"$identity\" signing identity found; building ad-hoc (per-app grants reset on every build)." >&2
 fi
 
+locked_args=(-- --locked)
+for arg in "$@"; do
+  if [[ "$arg" == -- ]]; then
+    locked_args=(--locked)
+    break
+  fi
+done
+
 # ${args[@]+...}: an empty array trips `set -u` in macOS's bash 3.2.
 if command -v cargo-tauri >/dev/null; then
-  cargo tauri build ${args[@]+"${args[@]}"} "$@"
+  cargo tauri build ${args[@]+"${args[@]}"} "$@" "${locked_args[@]}"
 else
-  npx --yes @tauri-apps/cli@^2 build ${args[@]+"${args[@]}"} "$@"
+  echo 'Tauri CLI is missing. Install the reviewed CLI before building.' >&2
+  exit 1
 fi

@@ -1,10 +1,9 @@
-# Release: tag vX.Y.Z → build the macOS app bundle (.dmg) and attach it to a
-# GitHub release. macOS-first per project direction; the CI matrix still
+# Release: manually dispatch from a verified vX.Y.Z tag to build the macOS
+# app bundle and attach it to a GitHub release. The CI matrix still
 # compile-checks Linux/Windows on every push.
 #
-# SIGNING / NOTARIZATION (currently UNSIGNED — Gatekeeper will warn):
-# when an Apple Developer ID is available, add these repo secrets and the
-# build picks them up automatically via tauri's environment integration:
+# Signing and notarization are required before attaching release artifacts.
+# Configure these secrets for Tauri's signing integration:
 #   APPLE_CERTIFICATE              base64 .p12
 #   APPLE_CERTIFICATE_PASSWORD
 #   APPLE_SIGNING_IDENTITY         "Developer ID Application: …"
@@ -13,64 +12,137 @@
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   macos:
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: macos-latest
-    env:
-      HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      # MACOSX_DEPLOYMENT_TARGET=11.0 makes ggml-metal emit @available runtime
-      # checks (___isPlatformVersionAtLeast); rustc links -nodefaultlibs, so
-      # pull in clang's runtime explicitly.
-      - name: Link clang runtime for availability checks
-        run: echo "RUSTFLAGS=-Clink-arg=$(clang --print-resource-dir)/lib/darwin/libclang_rt.osx.a" >> "$GITHUB_ENV"
-
-      - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: v2-metal  # cache from pre-metal builds left stale ggml objects
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - name: Frontend
-        run: npm ci && npm run build
+        run: npm ci --ignore-scripts && npm run build
         working-directory: frontend
-      # Tauri signs whenever APPLE_CERTIFICATE is PRESENT in the env — an
-      # unset GitHub secret expands to "" and still counts as present, which
-      # fails the keychain import. Export the vars only when actually set.
-      - name: Enable signing when secrets exist
-        if: ${{ env.HAS_APPLE_CERT == 'true' }}
-        run: |
-          {
-            echo "APPLE_CERTIFICATE<<RC_EOF";  echo "${{ secrets.APPLE_CERTIFICATE }}";  echo "RC_EOF"
-            echo "APPLE_CERTIFICATE_PASSWORD=${{ secrets.APPLE_CERTIFICATE_PASSWORD }}"
-            echo "APPLE_SIGNING_IDENTITY=${{ secrets.APPLE_SIGNING_IDENTITY }}"
-            echo "APPLE_ID=${{ secrets.APPLE_ID }}"
-            echo "APPLE_PASSWORD=${{ secrets.APPLE_PASSWORD }}"
-            echo "APPLE_TEAM_ID=${{ secrets.APPLE_TEAM_ID }}"
-          } >> "$GITHUB_ENV"
       - name: Build app bundle (.app + .dmg)
-        run: npx --yes @tauri-apps/cli@^2 build
         working-directory: app/src-tauri
+        shell: bash
         env:
-          # whisper.cpp needs std::filesystem (10.15+); we target Apple silicon.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           MACOSX_DEPLOYMENT_TARGET: "11.0"
-      - name: Build MCP shim (release)
-        run: cargo build --release -p roughcut-mcp-shim
+          NPM_CONFIG_IGNORE_SCRIPTS: "true"
+        run: |
+          APPLE_CERTIFICATE="$(printf '%s' "$APPLE_CERTIFICATE" | tr -d '\r\n')"
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            value="${!name}"
+            if [[ -z "$value" || "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+              printf 'Signing setting %s must be present and single-line.\n' "$name" >&2
+              exit 1
+            fi
+          done
+          npx --yes @tauri-apps/cli@2.10.1 build --config '{"build":{"beforeBuildCommand":""}}' -- --locked
+      - name: Notarize and verify macOS release artifacts
+        working-directory: target/release/bundle
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          codesign --verify --deep --strict 'macos/RoughCut.app'
+          spctl --assess --type execute 'macos/RoughCut.app'
+          shopt -s nullglob
+          images=(dmg/*.dmg)
+          if (( ${#images[@]} == 0 )); then
+            printf 'No macOS installer was produced.\n' >&2
+            exit 1
+          fi
+          for image in "${images[@]}"; do
+            if ! xcrun stapler validate "$image"; then
+              xcrun notarytool submit "$image" --apple-id "$APPLE_ID" \
+                --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+              xcrun stapler staple "$image"
+            fi
+            xcrun stapler validate "$image"
+          done
+      - name: Record build provenance
+        run: |
+          jq -n --arg commit "$(git rev-parse HEAD)" --arg tag "$GITHUB_REF_NAME" \
+            --arg rust "$(rustc --version)" --arg node "$(node --version)" \
+            --arg runner "$(uname -m)" --arg macos "$(sw_vers -productVersion)" \
+            '{commit: $commit, tag: $tag, rust: $rust, node: $node, architecture: $runner, macos: $macos, tauri_cli: "2.10.1"}' \
+            > 'target/release/bundle/dmg/BUILD-PROVENANCE.json'
+      - name: Record release dependencies and license
+        run: |
+          npm --prefix 'frontend' sbom --sbom-format cyclonedx --omit=dev \
+            > 'target/release/bundle/dmg/FRONTEND-SBOM.cdx.json'
+          cargo tree --locked --package roughcut-app --edges normal --prefix none --format '{p}|{l}' \
+            | sed -E 's@ \(/[^)]*\)\|@|@; s/ \(\*\)$//' | LC_ALL=C sort -u \
+            > 'target/release/bundle/dmg/RUST-DEPENDENCIES.txt'
+          cp 'LICENSE' 'target/release/bundle/dmg/LICENSE.txt'
+          git archive --format=tar.gz --prefix=RoughCut/ \
+            --output='target/release/bundle/dmg/RoughCut-source.tar.gz' HEAD -- \
+            'Cargo.toml' 'Cargo.lock' 'LICENSE' 'README.md' 'app' 'core' 'frontend' \
+            'mcp-shim' 'resolve-plugin' 'resources' 'scripts'
+      - name: Record artifact checksums
+        working-directory: target/release/bundle/dmg
+        shell: bash
+        run: |
+          shasum -a 256 ./*.dmg 'BUILD-PROVENANCE.json' 'FRONTEND-SBOM.cdx.json' \
+            'RUST-DEPENDENCIES.txt' 'LICENSE.txt' 'RoughCut-source.tar.gz' > 'SHA256SUMS.txt'
+      - name: Stage verified release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: verified-macos-release
+          if-no-files-found: error
+          path: |
+            target/release/bundle/dmg/*.dmg
+            target/release/bundle/dmg/SHA256SUMS.txt
+            target/release/bundle/dmg/BUILD-PROVENANCE.json
+            target/release/bundle/dmg/FRONTEND-SBOM.cdx.json
+            target/release/bundle/dmg/RUST-DEPENDENCIES.txt
+            target/release/bundle/dmg/LICENSE.txt
+            target/release/bundle/dmg/RoughCut-source.tar.gz
+  publish:
+    needs: macos
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: verified-macos-release
+          path: release-artifacts
+      - name: Verify downloaded artifact checksums
+        working-directory: release-artifacts
+        run: sha256sum --check --strict 'SHA256SUMS.txt'
       - name: Attach artifacts to the release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            target/release/bundle/dmg/*.dmg
-            target/release/bundle/macos/*.app.tar.gz
-            target/release/roughcut-mcp-shim
+            release-artifacts/*.dmg
+            release-artifacts/SHA256SUMS.txt
+            release-artifacts/BUILD-PROVENANCE.json
+            release-artifacts/FRONTEND-SBOM.cdx.json
+            release-artifacts/RUST-DEPENDENCIES.txt
+            release-artifacts/LICENSE.txt
+            release-artifacts/RoughCut-source.tar.gz
           generate_release_notes: true
+          fail_on_unmatched_files: true

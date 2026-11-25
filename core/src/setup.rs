@@ -95,7 +95,11 @@ pub async fn status(editor: &Editor) -> SetupStatus {
     let demo = editor.demo_mode();
     let ram_gb = capabilities::system_ram_gb();
     let prefs = editor.get_preferences().unwrap_or_default();
-    let (inference_reachable, models) = probe_inference(&prefs.inference_endpoint).await;
+    let (inference_reachable, models) = if editor.inference_enabled() {
+        probe_inference(&prefs.inference_endpoint).await
+    } else {
+        (false, Vec::new())
+    };
     let has = |tag: &str| {
         let base = tag.split(':').next().unwrap_or(tag);
         models.iter().any(|m| m == tag || m.starts_with(base))
@@ -215,7 +219,7 @@ pub const MODEL_TIERS: &[ModelTier] = &[
     },
 ];
 
-const MODEL_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
+const MODEL_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1";
 
 /// Stream a whisper model into the models dir, emitting `progress` events
 /// (task `model_download`). Streams to a `.part` file, verifies the sha256
@@ -230,7 +234,13 @@ pub async fn download_whisper_model(sink: &SharedSink, tier: &str) -> Result<Str
     std::fs::create_dir_all(&dir)?;
     let dest = dir.join(tier.file);
     if dest.is_file() {
-        return Ok(dest.to_string_lossy().into_owned());
+        let candidate = dest.clone();
+        let verified = tokio::task::spawn_blocking(move || {
+            crate::download::verify_file(&candidate, tier.sha256).is_ok()
+        }).await.unwrap_or(false);
+        if verified {
+            return Ok(dest.to_string_lossy().into_owned());
+        }
     }
     let url = format!("{MODEL_BASE_URL}/{}", tier.file);
     crate::events::send(
@@ -297,11 +307,15 @@ pub async fn download_aligner_model(sink: &SharedSink) -> Result<String> {
     use crate::events::{send, CoreEvent, ProgressTask};
     let dir = aligner_dir();
     std::fs::create_dir_all(&dir)?;
+    let verify_dir = dir.clone();
+    let already_verified = tokio::task::spawn_blocking(move || {
+        crate::adapters::align::verify_aligner_files(&verify_dir).is_ok()
+    }).await.unwrap_or(false);
+    if already_verified {
+        return Ok(dir.to_string_lossy().into_owned());
+    }
     for (file, sha, size) in ALIGNER_FILES {
         let dest = dir.join(file);
-        if dest.is_file() {
-            continue;
-        }
         send(sink, CoreEvent::progress(ProgressTask::ModelDownload, None, 0.0, format!("downloading {file}")));
         crate::download::download_to(
             sink,

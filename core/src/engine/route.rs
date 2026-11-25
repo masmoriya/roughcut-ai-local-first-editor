@@ -170,6 +170,9 @@ impl Editor {
     }
 
     fn inference_with(&self, policy: RunPolicy) -> Result<Box<dyn InferenceClient>> {
+        if !self.inference_enabled() {
+            return Err(CoreError::Unavailable("AI editing is disabled in the desktop editor".into()));
+        }
         let prefs = self.inner.store.load_preferences()?;
         let overrides = self.inner.route.overrides.lock().unwrap().clone();
         let local: Arc<dyn InferenceClient> = match &overrides {

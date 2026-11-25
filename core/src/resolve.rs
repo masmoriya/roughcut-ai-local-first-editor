@@ -44,7 +44,8 @@ fn resolve_app() -> Option<PathBuf> {
     .find(|p| p.is_dir())
 }
 
-fn app_installed() -> bool {
+/// Check standard macOS application locations without opening Resolve.
+pub fn app_installed() -> bool {
     resolve_app().is_some()
 }
 

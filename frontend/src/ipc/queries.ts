@@ -9,14 +9,13 @@ import {
   useQueryClient,
   type QueryClient,
 } from "@tanstack/react-query";
-import { callTool, onAppEvent } from "./api";
+import { callTool, isTauri, onAppEvent } from "./api";
 import type {
   DurationCutReceipt,
   EditResult,
   ExportResult,
   ExportTarget,
   ListProjectsResult,
-  Media,
   Preferences,
   Project,
   RoughCutResult,
@@ -25,6 +24,7 @@ import type {
   SplitResult,
   Timeline,
   Transcript,
+  TranscriptChangedEvent,
   UndoResult,
   MediaAssets,
   ClipBatchError,
@@ -52,6 +52,7 @@ export function useProjects() {
   return useQuery({
     queryKey: queryKeys.projects,
     queryFn: () => callTool<ListProjectsResult>("list_projects", {}),
+    enabled: isTauri,
   });
 }
 
@@ -64,10 +65,16 @@ export function useProject(projectId: string | null) {
 }
 
 export function useMediaAssets(projectId: string | null) {
+  const { data: project } = useProject(projectId);
+  const { data: transcript, isError: transcriptFailed } = useTranscript(projectId);
+  const media = project?.media;
+  const tracks = (media as { source_audio_tracks?: number } | undefined)?.source_audio_tracks ?? 0;
+  const audioStream = tracks > 1 ? project?.resolve_timeline?.dialogue_stream_index
+    ?? (transcript as { source_audio_stream_index?: number } | undefined)?.source_audio_stream_index : undefined;
   return useQuery({
-    queryKey: ["media-assets", projectId],
+    queryKey: ["media-assets", projectId, media?.id, media?.file_path, audioStream],
     queryFn: () => callTool<MediaAssets>("get_media_assets", { project_id: projectId }),
-    enabled: !!projectId,
+    enabled: !!projectId && !!media && (tracks <= 1 || audioStream !== undefined || transcript !== undefined || transcriptFailed),
     // Cheap once the cache exists (file-existence checks); a refetch on
     // focus picks up assets that finished generating in the background.
     staleTime: 30_000,
@@ -117,11 +124,11 @@ export function invalidateOnCoreEvents(queryClient: QueryClient): () => void {
   const offProposal = onAppEvent("cut-proposal-changed", () => {
     void queryClient.invalidateQueries({ queryKey: ["project"] });
   });
-  const offTranscript = onAppEvent("transcript-changed", () => {
-    void queryClient.invalidateQueries({ queryKey: ["transcript"] });
+  const offTranscript = onAppEvent<TranscriptChangedEvent>("transcript-changed", ({ project_id }) => {
+    void queryClient.invalidateQueries({ queryKey: queryKeys.transcript(project_id) });
     // Derived media (peaks/thumbnails/playable remux) lands around the same
     // time as the transcript; refresh so the player picks up playback_path.
-    void queryClient.invalidateQueries({ queryKey: ["media-assets"] });
+    void queryClient.invalidateQueries({ queryKey: ["media-assets", project_id] });
   });
   // Projects created/duplicated/deleted by ANY caller (incl. MCP clients)
   // refresh the library dropdown live.
@@ -192,11 +199,11 @@ export interface CutByTranscriptArgs extends Record<string, unknown> {
 }
 
 export function useCutByTranscript() {
-  return useEditMutation<CutByTranscriptArgs, EditResult>("cut_by_transcript", ["timeline", "project"]);
+  return useEditMutation<CutByTranscriptArgs & { transcript_id?: string }, EditResult>("cut_by_transcript", ["timeline", "project"]);
 }
 
 export function useRestoreByTranscript() {
-  return useEditMutation<CutByTranscriptArgs, EditResult>("restore_by_transcript", ["timeline", "project"]);
+  return useEditMutation<CutByTranscriptArgs & { transcript_id?: string }, EditResult>("restore_by_transcript", ["timeline", "project"]);
 }
 
 export interface RangeArgs extends Record<string, unknown> {
@@ -207,6 +214,39 @@ export interface RangeArgs extends Record<string, unknown> {
 
 export function useCutRange() {
   return useEditMutation<RangeArgs, EditResult>("cut_range", ["timeline", "project"]);
+}
+
+export function useReviewSearchCuts() {
+  return useEditMutation<{
+    project_id: string;
+    transcript_id: string;
+    ranges: { start: number; end: number; occurrenceKey: string; ruleKey: string }[];
+    category?: "search" | "fillers" | "profanity" | "keywords";
+  }, { proposed: number }>("review_search_cuts", ["project"]);
+}
+
+export function useImportTimedTranscript() {
+  return useEditMutation<{ project_id: string; text: string; format?: "json" | "srt"; confirm_source_clock?: boolean; confirmed_source_path?: string; confirmed_media_id?: string; audio_stream_index?: number }, { imported: boolean }>("import_timed_transcript", ["transcript"]);
+}
+
+export function useReviewPauses() {
+  return useEditMutation<{ project_id: string; review: true }, { proposed: number }>("remove_silences", ["project"]);
+}
+
+export function useProtectSourceRanges() {
+  return useEditMutation<{
+    project_id: string;
+    transcript_id?: string;
+    proposal_id?: string;
+    split_cut_id?: number;
+    ranges: { start: number; end: number }[];
+    remove?: boolean;
+  }, { protected: number }>("protect_source_ranges", ["project"]);
+}
+
+export function useHighlightSourceRanges() {
+  return useEditMutation<{ project_id: string; transcript_id?: string; ranges: SourceRange[]; remove?: boolean },
+    { highlighted: number }>("highlight_source_ranges", ["project"]);
 }
 
 export function useRestoreRange() {
@@ -279,7 +319,7 @@ export function useGenerateRoughCut() {
 
 /** Cut proposals: apply (one undoable edit), discard, skip/unskip. */
 export function useApplyCutProposal() {
-  return useEditMutation<{ project_id: string }, ApplyProposalResult>("apply_cut_proposal", [
+  return useEditMutation<{ project_id: string; proposal_id: string; selected_cut_ids: number[] }, ApplyProposalResult>("apply_cut_proposal", [
     "timeline",
     "project",
     "history",
@@ -287,12 +327,13 @@ export function useApplyCutProposal() {
 }
 
 export function useDiscardCutProposal() {
-  return useEditMutation<{ project_id: string }, { discarded: boolean }>("discard_cut_proposal", ["project"]);
+  return useEditMutation<{ project_id: string; proposal_id: string }, { discarded: boolean }>("discard_cut_proposal", ["project"]);
 }
 
 export interface SkipCutsArgs extends Record<string, unknown> {
   project_id: string;
   cut_ids?: number[];
+  proposal_id?: string;
   kind?: "pause" | "filler" | "words";
   skip?: boolean;
 }
@@ -303,11 +344,46 @@ export function useSkipProposedCuts() {
 
 import type { History } from "./generated/History";
 
+type HistoryWithReviews = Omit<History, "entries"> & {
+  entries: (History["entries"][number] & { has_cut_review?: boolean })[];
+};
+
+type HistoryCutReview = {
+  total: number;
+  decisions: {
+    cut_id: number;
+    approved: boolean;
+    rule_category?: "fillers" | "profanity" | "keywords" | "search";
+    min_word_confidence?: number;
+    source_in_frame: number;
+    source_out_frame: number;
+    context_before?: string;
+    context_after?: string;
+    phrase_matches?: {
+      match_id: string;
+      source_in_frame: number;
+      source_out_frame: number;
+      min_word_confidence?: number;
+      context_before?: string;
+      context_after?: string;
+    }[];
+  }[];
+};
+
 export function useHistory(projectId: string | null) {
   return useQuery({
     queryKey: ["history", projectId ?? "none"],
-    queryFn: () => callTool<History>("get_history", { project_id: projectId }),
+    queryFn: () => callTool<HistoryWithReviews>("get_history", { project_id: projectId }),
     enabled: projectId !== null,
+  });
+}
+
+export function useHistoryCutReview(projectId: string, actionId: string, offset: number) {
+  return useQuery({
+    queryKey: ["history", projectId, actionId, offset],
+    queryFn: () => callTool<HistoryCutReview | null>("get_history_cut_review", {
+      project_id: projectId, action_id: actionId, offset,
+    }),
   });
 }
 
@@ -328,14 +404,14 @@ export function useSuggestions(projectId: string | null) {
 }
 
 export function useAcceptSuggestion() {
-  return useEditMutation<{ project_id: string; suggestion_id: string }, unknown>(
+  return useEditMutation<{ project_id: string; suggestion_id: string }, { proposed: number }>(
     "accept_suggestion",
     ["timeline", "project", "suggestions"],
   );
 }
 
 export function useAcceptAllSuggestions() {
-  return useEditMutation<{ project_id: string }, unknown>(
+  return useEditMutation<{ project_id: string }, { proposed: number }>(
     "accept_all_suggestions",
     ["timeline", "project", "suggestions"],
   );
@@ -375,16 +451,13 @@ export function useExport() {
 }
 
 export function useSetPreferences() {
-  return useEditMutation<{ preferences: Partial<Preferences> }, Preferences>("set_preferences", ["preferences"]);
+  return useEditMutation<{ preferences: Partial<Preferences>; expected_rule_sets?: Preferences["saved_rule_sets"] }, Preferences>("set_preferences", ["preferences"]);
 }
 
 export function useCreateProject() {
   return useEditMutation<{ name: string; file_path?: string }, Project>("create_project", ["projects", "project"]);
 }
 
-export function useImportMedia() {
-  return useEditMutation<{ file_path: string }, Media>("import_media", ["project"]);
-}
 
 export function useTranscribe() {
   return useEditMutation<{ project_id: string; language?: string }, Transcript>("transcribe", [

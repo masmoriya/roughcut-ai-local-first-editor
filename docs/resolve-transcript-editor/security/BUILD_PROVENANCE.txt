@@ -1,0 +1,22 @@
+Local verification provenance
+
+Baseline: 224753a7a9c2a8d998248bff1046e9d56604071d
+The reviewed worktree has local changes beyond the baseline.
+Desktop dependency target: aarch64-apple-darwin
+Tools: rustc 1.93.1, Cargo 1.93.1, Node v22.23.4, npm 10.9.9
+
+Lockfile SHA-256
+Cargo.lock: 63b036662428ba59ffbf8fd0804eea6a047939f3e031047125d99f68a06e8fbb
+frontend/package-lock.json: 779d328646f1f5ac9fe5b7f52620cb0201b799ded172f13e1ac45839da8e30d4
+
+Offline locked Cargo metadata resolved for the desktop target. OSV returned
+zero known advisories for its 317 registry packages. The npm lockfile audit
+returned zero findings. See ../LOCAL-VERIFICATION.md for the test scope.
+
+A built artifact, release SBOM, reproducibility receipt, signing and artifact
+checksums are pending. These lockfile digests identify dependency inputs.
+Desktop feature resolution
+An offline, locked Cargo tree for roughcut-app on aarch64-apple-darwin
+listed 298 distinct package rows across normal and build dependencies.
+It contained no Whisper, wav2vec, Candle, MCP shim or portable PTY packages.
+This dependency resolution check did not compile or launch the application.
