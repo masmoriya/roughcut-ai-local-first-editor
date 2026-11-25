@@ -1,0 +1,37 @@
+Upstream: https://github.com/PaulBratslavsky/roughcut-ai-local-first-editor
+Fork: https://github.com/masmoriya/roughcut-ai-local-first-editor
+Pinned commit: 224753a7a9c2a8d998248bff1046e9d56604071d
+Recorded: 2026-11-11
+License: GPL-3.0 (upstream LICENSE preserved).
+No release artifact downloaded or executed.
+No submodules or tracked symlinks in the pinned tree.
+
+Initial reviewed paths: .claude/settings.json, .mcp.json,
+app/src-tauri/tauri.conf.json, app/src-tauri/src/lib.rs,
+core/src/engine/mod.rs and core/src/llm_runtime.rs.
+Removed automatic Claude plugin and MCP shim registration.
+Removed environment-based bypass of production confirmations.
+
+Removed automatic desktop MCP startup and renderer access to endpoint
+credentials. Explicit MCP opt-in and lifecycle controls are pending.
+Removed desktop PTY commands and the corresponding editor and player UI.
+Disabled the wildcard asset protocol. The custom protocol serves approved
+media and exact cache paths from successful core responses. Added a CSP
+and restricted media MIME types and cross-origin reads.
+Disabled managed llama-server install, launch, and arbitrary GGUF downloads
+pending a verified artifact manifest and installer.
+MCP discovery now requires a private Unix directory and uses atomic writes.
+The server issues per-launch tokens and checks Host, Origin, and body size.
+Resolve scripts enforce a loopback URL and reject redirects and proxies.
+Open: verified runtime provisioning, MCP opt-in and lifecycle, and live
+desktop validation of the media policy and CSP.
+Target: local macOS Resolve. Edition and import compatibility unverified.
+
+Local media smoke check (2026-11-11):
+Read-only ffprobe with the editor's file protocol and media format
+allowlists opened BTN S03E02_V2.mov. Observed MOV, H.264 at 30000/1001,
+48 kHz stereo PCM audio, and 3172.135633 seconds container duration.
+FFmpeg decoded two seconds to 16 kHz mono signed 16-bit PCM on stdout.
+Observed 64000 bytes; no output file was created.
+This verifies the source container and decode flags on the installed
+toolchain. Desktop transcription, XML import and A/V sync remain unverified.

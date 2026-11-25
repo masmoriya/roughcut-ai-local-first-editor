@@ -1,0 +1,47 @@
+RoughCut local Resolve editor
+Release status: unverified. No release artifact has been built or published.
+
+Source
+Fork: https://github.com/masmoriya/roughcut-ai-local-first-editor
+Upstream baseline: 224753a7a9c2a8d998248bff1046e9d56604071d
+Release revision and source archive: pending an immutable release candidate.
+License and third-party notices: see repository LICENSE and security/BASELINE.txt.
+Redistribution approval: pending.
+
+Evidence
+LOCAL-VERIFICATION.md records the standalone frame and XML helper tests,
+locked dependency review, and read-only BTN source probes. The reviewed
+source includes local changes beyond the baseline.
+Dependency inputs: security/BUILD_PROVENANCE.txt,
+security/CARGO-DEPENDENCIES-aarch64-apple-darwin.tsv, and
+security/FRONTEND-DEPENDENCIES.cdx.json.
+Desktop build, media-access tests, offline runtime check, and Resolve import
+and sync checks: pending. The desktop build disables MCP and inference.
+
+Local data and uninstall
+On macOS, RoughCut stores its SQLite library under
+~/Library/Application Support/roughcut. That directory also holds
+generated waveform and preview caches and joined media created
+by Append Media. Preserve the whole directory while the app is closed
+if you need to restore projects, transcripts, edit history, or joined
+media. Removing the application leaves this data on disk. Removing the
+data directory also removes the local library and any joined media
+stored there. Original sources and manually exported files live at
+their chosen paths. The standalone workflow uses Resolve's manual XML
+import and requires no Resolve script installation.
+Trashed projects can be restored from the project picker. On startup,
+RoughCut purges projects that have been in the trash for over 30 days.
+Diagnostic logs are stored separately in ~/Library/Logs/RoughCut when the
+macOS home directory is available. They include platform and version
+information and structured FFmpeg failure metadata, including the
+operation, exit status and elapsed time. The FFmpeg failure event omits
+process stderr. Removing the application also leaves that log directory
+on disk.
+
+Distribution
+Signing, notarization, artifact SHA-256, SBOM, clean install, upgrade,
+uninstall and rollback receipts: pending.
+Publish approval: pending.
+The release workflow requires manual dispatch from a version tag.
+The release workflow pins Tauri CLI 2.10.1, matching the local CLI version
+recorded during setup. Compatibility with the locked desktop build is pending.
