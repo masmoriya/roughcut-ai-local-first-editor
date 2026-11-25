@@ -1694,8 +1694,8 @@ async fn clips_from_several_pieces_in_either_format() {
     assert!(err.contains("landscape"), "got: {err}");
 
     // The EDL plays the two pieces back to back.
-    let out = std::env::temp_dir().join("roughcut-e2e-clips").join("bookends.edl");
-    std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+    let export_dir = tempfile::tempdir().unwrap();
+    let out = export_dir.path().join("bookends.edl");
     let r = call(
         &editor,
         "export_clip",

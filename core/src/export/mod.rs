@@ -313,7 +313,7 @@ impl Editor {
                     project_id,
                 });
                 self.write_export(&project, transcript.as_ref(), target, temporary, &pieces, None, &sink).await?;
-                std::fs::File::open(&file)?.sync_all()?;
+                std::fs::OpenOptions::new().write(true).open(&file)?.sync_all()?;
                 publish_export(&file, &destination).map_err(export_write_error)?;
                 return Ok(ExportReceipt { path: destination.to_string_lossy().into_owned(), resolve_timeline: None });
             }
@@ -392,7 +392,7 @@ impl Editor {
             CoreError::InvalidArg("Choose an export directory with a Unicode path".into())
         })?;
         self.export_clip_with(project_id, clip_id, target, temporary, &self.sink()).await?;
-        std::fs::File::open(&file)?.sync_all()?;
+        std::fs::OpenOptions::new().write(true).open(&file)?.sync_all()?;
         publish_export(&file, &destination).map_err(export_write_error)?;
         Ok(destination.to_string_lossy().into_owned())
     }
@@ -468,7 +468,7 @@ impl Editor {
                     CoreError::InvalidArg("Choose an export directory with a Unicode path".into())
                 })?;
                 self.export_clip_with(project_id, clip_id, target, path, &sink).await?;
-                std::fs::File::open(&temporary)?.sync_all()?;
+                std::fs::OpenOptions::new().write(true).open(&temporary)?.sync_all()?;
                 publish_batch_file(&temporary, &dir, &name)
             }.await;
             results.push(match out {
