@@ -93,6 +93,9 @@ Errors: every tool returns either its result or `{ "error": { "code": string, "m
 ### Ingest & transcription
 - `append_media { project_id, file_path } -> { media, note }` — lossless concat to the END of the source (new file; originals untouched; cuts keep timestamps; undo history and checkpoints are extended to cover the new footage; the append itself is not undoable; re-run `transcribe` after)
 - `import_media { file_path, project_id? } -> Media` — probes the file. With `project_id`: a project with no media gets it and a fresh timeline; a project whose video moved is relinked to the same video at a new path (matching duration, size, and frame rate keeps cuts, history, transcript, and clips); a different video is refused (`invalid_argument` — create a new project or use `append_media`)
+- `import_timed_transcript { project_id, text, format?, confirm_source_clock?, confirmed_source_path?, confirmed_media_id?, audio_stream_index? } -> { imported }` — import timed JSON or SRT captions; external transcript clocks must be confirmed against the attached media
+- `cancel_transcription { project_id } -> { cancelled }` — cancel the active transcription
+- `correct_transcript_segment { project_id, segment_id, original, original_speaker, text, speaker? } -> { saved }` — correct recognized text or speaker while preserving word timing; editor only
 - `transcribe { project_id, language? } -> Transcript` (long-running; `progress` events)
 - `retime_words { project_id } -> { aligned, chunks, chunks_kept, words, trimmed, seconds_removed, relocated, note? }` — fixes the existing transcript's word times as transcription now does: forced alignment against the audio with the local word alignment model (English; `aligned`, `Transcript.words_aligned`), then the audio trim (`Transcript.words_trimmed`). `note` says why alignment didn't run (no model, not English). No text or cut changes. UI and MCP only
 
@@ -113,8 +116,11 @@ Cuts worked out but not made (`Project.cut_proposal`, one per project). `generat
 - `apply_cut_proposal { project_id } -> { action: EditAction | null, applied, skipped, seconds, cut_count, included_duration_s }` — makes the cuts not skipped as ONE undoable edit (op `cut_ranges`, kind `ai_batch`, after an automatic "Before …" checkpoint) and clears the proposal. A plain "apply" / "yes" in the chat does this without a model turn
 - `discard_cut_proposal { project_id } -> { discarded }` — drops the proposal, cuts nothing
 - `skip_proposed_cuts { project_id, cut_ids?: number[], kind?: "pause"|"filler"|"words", skip?: boolean } -> { changed, to_apply, skipped, seconds_to_apply }` — leaves cuts out (`skip`, default true) or puts them back, by number, kind, both, or all
+- `review_search_cuts { project_id, transcript_id, ranges, category? } -> proposal receipt` — prepare timed search, filler, profanity, or keyword matches for manual cut review
+- `protect_source_ranges { project_id, ranges, transcript_id?, proposal_id?, split_cut_id?, remove? } -> { protected }` — keep source ranges out of automatic cut proposals, or remove protection
 
 ### Editing
+- `highlight_source_ranges { project_id, ranges, transcript_id?, remove? } -> { highlighted }` — mark source passages without changing the timeline; editor only
 - `apply_edits { project_id, edits: [EditOp] } -> { applied, actions: [EditAction], cut_count, included_duration_s, source_duration_s }` (+ `requested`; on a mid-batch failure returns a PARTIAL receipt `{applied, requested, actions, failed_at, error, note}` — applied edits are journaled and undoable) — batch power tool for orchestrators (≤100 ops/call, each individually undoable; lean receipt, use `get_timeline` for clips)
 - `cut_passage { project_id, from_segment_id?, to_segment_id?, start?, end? } -> { action, timeline, cut: { start, end, seconds, starts_with, ends_with } }` — cuts ONE whole passage (first to last segment, or seconds) in one undoable cut; both edges snap to the nearest sentence end or clear pause within ~10 s. Refuses spans over 30 minutes (use `plan_duration_cut`)
 - `cut_range { project_id, start, end, snap? } -> { action: EditAction, timeline: Timeline }` — `snap: "word"|"sentence"` lands the cut on clean boundaries from word timings (default `none`); also accepted per-edit on `cut_range` ops inside `apply_edits`
@@ -178,6 +184,7 @@ A saved clip is a standalone edit made of one or more pieces of the long-form vi
 - `restore_checkpoint { project_id, checkpoint_id } -> { action }` — restore a checkpoint as an undoable edit
 - `delete_checkpoint { project_id, checkpoint_id } -> { deleted }` — delete a checkpoint
 - `get_history { project_id } -> { entries: [{id, kind, source, description, timestamp, applied}], current_index }` — full edit history oldest→newest (applied then undone/future); current_index = newest applied (-1 = original)
+- `get_history_cut_review { project_id, action_id, offset? } -> CutReview | null` — read the saved paged review for a history action
 - `jump_to { project_id, action_id? } -> { timeline }` — go back/forward to a history point (undo/redo until that action is newest applied); null action_id = the original
 - `undo { project_id } -> { action: EditAction|null, timeline }`
 - `redo { project_id } -> { action: EditAction|null, timeline }`
