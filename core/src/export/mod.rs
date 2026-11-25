@@ -239,9 +239,7 @@ impl Editor {
         }
         let mut source_fingerprint = None;
         let mut screen_fingerprint = None;
-        if project.clip_session.is_some() {
-            return Err(CoreError::InvalidArg("Save or cancel the clip edit before exporting the whole video".into()));
-        }
+        self.require_no_clip_session(project_id, "exporting the whole video")?;
         let path = PathBuf::from(expand_tilde(out_path));
         let parent = path.parent().filter(|parent| parent.is_absolute()).ok_or_else(|| {
             CoreError::InvalidArg("Choose an absolute export path".into())

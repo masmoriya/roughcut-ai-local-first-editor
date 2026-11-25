@@ -1278,7 +1278,7 @@ mod tests {
         editor.begin_clip_edit(pid, clip.id).unwrap();
         let ctx = project_context_with(&editor, pid, 1_000_000).unwrap();
         assert!(ctx.contains("editing the saved clip “Ending”"), "{ctx}");
-        let line_of = |text: &str| format!("| {text}\n");
+        let line_of = |text: &str| format!("| \"{text}\"");
         assert!(ctx.contains(&line_of(&last.text)), "the clip's own line:\n{ctx}");
         assert!(!ctx.contains(&line_of(&first.text)), "not the far start of the video:\n{ctx}");
         editor.end_clip_edit(pid, false).unwrap();
